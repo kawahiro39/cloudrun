@@ -1,0 +1,460 @@
+import os
+import re
+import io
+import base64
+import tempfile
+import zipfile
+import shutil
+import subprocess
+import xml.etree.ElementTree as ET
+from typing import Dict, Tuple, List, Optional
+
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.responses import JSONResponse
+
+app = FastAPI(title="Doc/Excel → PDF & JPEG API (stable)")
+
+# ------------ light helpers ------------
+def file_ext_lower(name: str) -> str:
+    return os.path.splitext(name)[1].lower()
+
+def data_uri(mime: str, data: bytes) -> str:
+    import base64 as _b64
+    b64 = _b64.b64encode(data).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
+def run(cmd: List[str], cwd: Optional[str] = None):
+    proc = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"Command failed: {' '.join(cmd)}\n"
+            f"STDOUT:\n{proc.stdout.decode('utf-8', 'ignore')}\n"
+            f"STDERR:\n{proc.stderr.decode('utf-8', 'ignore')}"
+        )
+    return proc
+
+def ok(d): return JSONResponse(status_code=200, content=d)
+def err(m, status=400): return JSONResponse(status_code=status, content={"error": str(m)})
+
+# ------------ tag & number parsing ------------
+VAR_NAME = r"[A-Za-z_][A-Za-z0-9_]*"
+IMG_KEY_PATTERN = re.compile(rf"^\{{\[(?P<var>{VAR_NAME})\](?::(?P<size>[^}}]+))?\}}$")
+TXT_KEY_PATTERN = re.compile(rf"^\{{(?P<var>{VAR_NAME})\}}$")
+MM_RE      = re.compile(r'^\s*(\d+(?:\.\d+)?)\s*mm\s*$', re.IGNORECASE)
+NUM_PLAIN  = re.compile(r'^\s*-?\d+(?:\.\d+)?\s*$')
+NUM_COMMA  = re.compile(r'^\s*-?\d{1,3}(?:,\d{3})+(?:\.\d+)?\s*$')
+NUM_PCT    = re.compile(r'^\s*-?\d+(?:\.\d+)?\s*%\s*$')
+
+def parse_size_mm(s: Optional[str]) -> Optional[float]:
+    if not s: return None
+    m = MM_RE.match(s.strip()); return float(m.group(1)) if m else None
+
+def parse_numberlike(s: str) -> Tuple[Optional[float], Optional[str]]:
+    if s is None: return None, None
+    st = s.strip()
+    if NUM_PCT.match(st):
+        num = st.replace("%", "").strip()
+        try:
+            v = float(num.replace(",", "")) / 100.0
+            fmt = "0.00%" if "." in num else "0%"
+            return v, fmt
+        except: return None, None
+    if NUM_COMMA.match(st) or NUM_PLAIN.match(st):
+        try:
+            c = st.replace(",", "") if "," in st else st
+            return (float(c), None) if "." in c else (int(c), None)
+        except: return None, None
+    return None, None
+
+def _with_newlines(v: str) -> str:
+    return (v or "").replace("<br>", "\n")
+
+def parse_mapping_text(raw: str) -> Tuple[Dict[str, str], Dict[str, Dict]]:
+    """
+    {a}:X,{b}:Y でも 改行でもOK。URL内カンマ保護。
+    {[img]:50mm}:URL / {[img]}:URL
+    """
+    text_map: Dict[str, str] = {}
+    image_map: Dict[str, Dict] = {}
+    if not raw: return text_map, image_map
+
+    SAFE = "\u241B"  # protect ://
+    protected = [line.replace("://", SAFE) for line in raw.splitlines()]
+    joined = "\n".join(protected)
+
+    items: List[str] = []
+    for line in joined.splitlines():
+        if not line.strip(): continue
+        for seg in line.split(","):
+            seg = seg.strip()
+            if seg: items.append(seg.replace(SAFE, "://"))
+
+    for seg in items:
+        if ":" not in seg: continue
+        key, value = seg.split(":", 1)
+        key = key.strip(); value = value.strip()
+
+        m_img = IMG_KEY_PATTERN.match(key)
+        if m_img:
+            v = m_img.group("var"); mm = parse_size_mm(m_img.group("size") or "")
+            image_map[v] = {"url": value, "mm": mm}; continue
+
+        m_txt = TXT_KEY_PATTERN.match(key)
+        if m_txt:
+            v = m_txt.group("var"); text_map[v] = _with_newlines(value); continue
+
+    return text_map, image_map
+
+def mm_to_pixels(mm: float, dpi: int = 96) -> int:
+    return int(round(mm / 25.4 * dpi))
+
+def parse_pages_arg(pages: str, total_pages: int) -> List[int]:
+    pages = (pages or "1").strip()
+    out: List[int] = []
+    for part in pages.split(","):
+        part = part.strip()
+        if not part: continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            try:
+                s = max(1, int(a)); e = min(total_pages, int(b))
+                if s <= e: out.extend(range(s, e+1))
+            except: pass
+        else:
+            try:
+                p = int(part)
+                if 1 <= p <= total_pages: out.append(p)
+            except: pass
+    return sorted(list(dict.fromkeys(out))) or [1]
+
+# ------------ Word (.docx) ------------
+WORD_XML_TARGETS = ("word/document.xml","word/footnotes.xml","word/endnotes.xml","word/comments.xml")
+
+def _word_content_xmls(extracted_dir: str) -> List[str]:
+    targets = list(WORD_XML_TARGETS)
+    wdir = os.path.join(extracted_dir, "word")
+    if os.path.isdir(wdir):
+        for fn in os.listdir(wdir):
+            if fn.startswith("header") and fn.endswith(".xml"): targets.append(f"word/{fn}")
+            if fn.startswith("footer") and fn.endswith(".xml"): targets.append(f"word/{fn}")
+    return [os.path.join(extracted_dir, p) for p in targets if os.path.exists(os.path.join(extracted_dir, p))]
+
+def docx_convert_tags_to_jinja(in_docx: str, out_docx: str):
+    # {var}/{[var]} → {{ var }} へ。英数字+下線のタグのみ変換（Jinja誤爆防止）
+    tmpdir = tempfile.mkdtemp()
+    try:
+        with zipfile.ZipFile(in_docx, 'r') as zin:
+            zin.extractall(tmpdir)
+        for p in _word_content_xmls(tmpdir):
+            s = open(p, "r", encoding="utf-8").read()
+            s = re.sub(rf"\{{\[\s*({VAR_NAME})\s*\]\}}", r"{{ \1 }}", s)
+            s = re.sub(rf"\{{\s*({VAR_NAME})\s*\}}",       r"{{ \1 }}", s)
+            open(p, "w", encoding="utf-8").write(s)
+        with zipfile.ZipFile(out_docx, 'w', zipfile.ZIP_DEFLATED) as zout:
+            for root, _, files in os.walk(tmpdir):
+                for fn in files:
+                    full = os.path.join(root, fn)
+                    zout.write(full, os.path.relpath(full, tmpdir))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+def docx_render(in_docx: str, out_docx: str, text_map: Dict[str, str], image_map: Dict[str, Dict]):
+    from docxtpl import DocxTemplate, InlineImage
+    from docx.shared import Mm
+    import requests
+
+    tmp = in_docx + ".jinja.docx"
+    docx_convert_tags_to_jinja(in_docx, tmp)
+
+    doc = DocxTemplate(tmp)
+    ctx: Dict[str, object] = {}
+    for k, v in text_map.items(): ctx[k] = v
+    for k, meta in image_map.items():
+        r = requests.get(meta["url"], timeout=20); r.raise_for_status()
+        bio = io.BytesIO(r.content)
+        ctx[k] = InlineImage(doc, bio, width=Mm(meta["mm"])) if meta.get("mm") else InlineImage(doc, bio)
+    doc.render(ctx)
+    doc.save(out_docx)
+    os.remove(tmp)
+
+    # 図形内テキストなどに残った {{var}} を後置換
+    tmpdir = tempfile.mkdtemp()
+    try:
+        with zipfile.ZipFile(out_docx, 'r') as zin:
+            zin.extractall(tmpdir)
+        for p in _word_content_xmls(tmpdir):
+            s = open(p, "r", encoding="utf-8").read()
+            for k, v in text_map.items():
+                s = s.replace(f"{{{{ {k} }}}}", v).replace(f"{{{{{k}}}}}", v)
+            open(p, "w", encoding="utf-8").write(s)
+        with zipfile.ZipFile(out_docx, 'w', zipfile.ZIP_DEFLATED) as zout:
+            for root, _, files in os.walk(tmpdir):
+                for fn in files:
+                    full = os.path.join(root, fn)
+                    zout.write(full, os.path.relpath(full, tmpdir))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+# ------------ Excel (.xlsx) ------------
+def xlsx_force_full_recalc(extracted_dir: str):
+    p = os.path.join(extracted_dir, "xl", "workbook.xml")
+    if not os.path.exists(p): return
+    ns = {"s":"http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    tree = ET.parse(p); root = tree.getroot()
+    calcPr = root.find("s:calcPr", ns) or ET.SubElement(root, f"{{{ns['s']}}}calcPr")
+    calcPr.set("calcMode", "auto")
+    calcPr.set("fullCalcOnLoad", "1")
+    chain = os.path.join(extracted_dir, "xl", "calcChain.xml")
+    if os.path.exists(chain):
+        try: os.remove(chain)
+        except: pass
+    tree.write(p, encoding="utf-8", xml_declaration=True)
+
+def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str], image_map: Dict[str, Dict]):
+    """
+    1) XML直編集で {var} を置換（完全一致は数値化、<br>→\n）、{[img]} はセルから除去し placements に記録
+    2) fullCalcOnLoad=1 で再計算
+    3) openpyxl で placements に新規画像挿入（既存図形/グラフは原則維持）
+    """
+    ns = {"s":"http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    tmpdir = tempfile.mkdtemp()
+    placements: List[Tuple[str, str, str]] = []  # (sheet_file, cell_ref, var)
+    try:
+        with zipfile.ZipFile(src_xlsx, 'r') as zin:
+            zin.extractall(tmpdir)
+
+        # sharedStrings
+        sst_path = os.path.join(tmpdir, "xl", "sharedStrings.xml")
+        numeric_candidates: Dict[int, Tuple[bool, Optional[float]]] = {}
+        img_sst_idx: Dict[int, str] = {}
+
+        if os.path.exists(sst_path):
+            tree = ET.parse(sst_path); root = tree.getroot(); idx = -1
+            for si in root.findall("s:si", ns):
+                idx += 1
+                t_nodes = si.findall("s:t", ns)
+                if t_nodes:
+                    original = "".join([t.text or "" for t in t_nodes])
+                else:
+                    original = "".join([(r.find("s:t", ns).text or "") for r in si.findall("s:r", ns) if r.find("s:t", ns) is not None])
+
+                # 画像タグ？
+                m_img = re.fullmatch(rf"\{{\[\s*({VAR_NAME})\s*\]\}}", original or "")
+                if m_img:
+                    img_sst_idx[idx] = m_img.group(1)
+                    for r in list(si): si.remove(r)
+                    t = ET.SubElement(si, f"{{{ns['s']}}}t"); t.text = ""
+                    continue
+
+                # テキスト置換
+                replaced = original
+                for k, v in text_map.items(): replaced = replaced.replace(f"{{{k}}}", _with_newlines(v))
+
+                # 書き戻し
+                for r in list(si): si.remove(r)
+                t = ET.SubElement(si, f"{{{ns['s']}}}t"); t.text = replaced
+
+                # 完全一致 = 数値候補
+                for k, v in text_map.items():
+                    if original == f"{{{k}}}":
+                        num, _ = parse_numberlike(v)
+                        numeric_candidates[idx] = ((num is not None), num)
+                        break
+
+            tree.write(sst_path, encoding="utf-8", xml_declaration=True)
+
+        # worksheets
+        ws_dir = os.path.join(tmpdir, "xl", "worksheets")
+        if os.path.isdir(ws_dir):
+            for fn in os.listdir(ws_dir):
+                if not fn.endswith(".xml"): continue
+                p = os.path.join(ws_dir, fn)
+                tree = ET.parse(p); root = tree.getroot()
+
+                for c in root.findall(".//s:c", ns):
+                    t_attr = c.get("t")
+                    v_node = c.find("s:v", ns)
+                    is_node = c.find("s:is", ns)
+
+                    # shared string
+                    if t_attr == "s" and v_node is not None and v_node.text:
+                        try: sst_idx = int(v_node.text)
+                        except: sst_idx = None
+                        if sst_idx is not None and sst_idx in img_sst_idx:
+                            # 画像座標として記録してセルは空に
+                            r_attr = c.get("r") or ""
+                            placements.append((fn, r_attr, img_sst_idx[sst_idx]))
+                            c.attrib.pop("t", None)
+                            c.remove(v_node)
+                            continue
+                        if sst_idx is not None and sst_idx in numeric_candidates:
+                            is_num, num_val = numeric_candidates[sst_idx]
+                            if is_num and num_val is not None:
+                                c.set("t", "n")
+                                v_node.text = str(num_val)
+
+                    # inlineStr
+                    if t_attr == "inlineStr" and is_node is not None:
+                        t_inline = is_node.find("s:t", ns)
+                        if t_inline is not None and t_inline.text is not None:
+                            txt = t_inline.text
+                            m_img = re.fullmatch(rf"\{{\[\s*({VAR_NAME})\s*\]\}}", txt or "")
+                            if m_img:
+                                r_attr = c.get("r") or ""
+                                placements.append((fn, r_attr, m_img.group(1)))
+                                c.attrib.pop("t", None)
+                                try: c.remove(is_node)
+                                except: pass
+                                if v_node is not None:
+                                    c.remove(v_node)
+                                continue
+                            # テキスト置換／数値化
+                            replaced = txt
+                            for k, v in text_map.items(): replaced = replaced.replace(f"{{{k}}}", _with_newlines(v))
+                            for k, v in text_map.items():
+                                if txt == f"{{{k}}}":
+                                    num, _ = parse_numberlike(v)
+                                    if num is not None:
+                                        c.set("t", "n")
+                                        try: c.remove(is_node)
+                                        except: pass
+                                        if v_node is None: v_node = ET.SubElement(c, f"{{{ns['s']}}}v")
+                                        v_node.text = str(num)
+                                        break
+                            else:
+                                t_inline.text = replaced
+
+                tree.write(p, encoding="utf-8", xml_declaration=True)
+
+        # 再計算フラグ
+        xlsx_force_full_recalc(tmpdir)
+
+        # 再パック
+        with zipfile.ZipFile(dst_xlsx, 'w', zipfile.ZIP_DEFLATED) as zout:
+            for root, _, files in os.walk(tmpdir):
+                for fn in files:
+                    full = os.path.join(root, fn)
+                    zout.write(full, os.path.relpath(full, tmpdir))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    # openpyxl で画像を追加（既存図形・グラフは通常維持）
+    if placements and image_map:
+        from openpyxl import load_workbook
+        from openpyxl.drawing.image import Image as XLImage
+        from PIL import Image as PILImage
+        import requests
+
+        wb = load_workbook(dst_xlsx)
+        for sheet_file, cell_ref, var in placements:
+            meta = image_map.get(var)
+            if not meta: continue
+            url = meta["url"]; mm = meta.get("mm")
+            r = requests.get(url, timeout=20); r.raise_for_status()
+            img = PILImage.open(io.BytesIO(r.content)).convert("RGBA")
+            if mm:
+                px = mm_to_pixels(mm, dpi=96)
+                w, h = img.size
+                new_h = int(round(h * (px / w))) if w else h
+                img = img.resize((px, new_h), PILImage.LANCZOS)
+            bio = io.BytesIO(); img.save(bio, format="PNG"); bio.seek(0)
+            # sheet_file は "sheetX.xml"。概ねワークブックの順序に対応
+            sheet_index = int(re.findall(r'\d+', sheet_file)[0]) - 1
+            ws = wb.worksheets[sheet_index] if 0 <= sheet_index < len(wb.worksheets) else wb.active
+            ws.add_image(XLImage(bio), cell_ref)
+        wb.save(dst_xlsx)
+
+# ------------ PDF / JPEG ------------
+def libreoffice_to_pdf(input_path: str, out_dir: str) -> str:
+    if not os.path.isdir(out_dir): os.makedirs(out_dir, exist_ok=True)
+    run([
+        "soffice", "--headless", "--nologo", "--nodefault", "--nolockcheck", "--norestore",
+        "--convert-to", "pdf", "--outdir", out_dir, input_path
+    ])
+    base = os.path.splitext(os.path.basename(input_path))[0]
+    pdf_path = os.path.join(out_dir, f"{base}.pdf")
+    if not os.path.exists(pdf_path):
+        for fn in os.listdir(out_dir):
+            if fn.lower().endswith(".pdf"):
+                pdf_path = os.path.join(out_dir, fn); break
+    if not os.path.exists(pdf_path): raise RuntimeError("PDF not produced by LibreOffice.")
+    return pdf_path
+
+def pdf_to_jpegs(pdf_path: str, dpi: int, pages: List[int]) -> List[Tuple[int, bytes]]:
+    out: List[Tuple[int, bytes]] = []
+    for p in pages:
+        prefix = f"{pdf_path}-p{p}"
+        run(["pdftoppm", "-jpeg", "-r", str(dpi), "-f", str(p), "-l", str(p), pdf_path, prefix])
+        jpg = f"{prefix}-1.jpg"
+        if not os.path.exists(jpg):
+            alt = f"{prefix}.jpg"
+            jpg = alt if os.path.exists(alt) else jpg
+        if not os.path.exists(jpg):
+            for fn in os.listdir(os.path.dirname(pdf_path)):
+                if fn.startswith(os.path.basename(prefix)) and fn.lower().endswith(".jpg"):
+                    jpg = os.path.join(os.path.dirname(pdf_path), fn); break
+        if not os.path.exists(jpg): raise RuntimeError(f"Failed to create JPEG page {p}")
+        with open(jpg, "rb") as f: out.append((p, f.read()))
+        try: os.remove(jpg)
+        except: pass
+    return out
+
+# ------------ API ------------
+@app.get("/healthz")
+def healthz():
+    # Cloud Run 起動判定用：即応答
+    return {"ok": True}
+
+@app.post("/merge")
+async def merge(
+    file: UploadFile = File(...),
+    mapping_text: str = Form(""),
+    filename: str = Form("document"),
+    jpeg_dpi: int = Form(150),
+    jpeg_pages: str = Form("1"),
+):
+    from pypdf import PdfReader  # lazy import
+
+    try:
+        ext = file_ext_lower(file.filename or "")
+        if ext not in [".docx", ".xlsx"]:
+            return err("file must be .docx or .xlsx", 400)
+
+        text_map, image_map = parse_mapping_text(mapping_text or "")
+
+        with tempfile.TemporaryDirectory() as td:
+            src = os.path.join(td, f"src{ext}")
+            with open(src, "wb") as f: f.write(await file.read())
+
+            rendered = os.path.join(td, f"rendered{ext}")
+            if ext == ".docx":
+                docx_render(src, rendered, text_map, image_map)
+            else:
+                xlsx_patch_and_place(src, rendered, text_map, image_map)
+
+            pdf_dir = os.path.join(td, "pdf")
+            pdf_path = libreoffice_to_pdf(rendered, pdf_dir)
+
+            with open(pdf_path, "rb") as f:
+                total_pages = len(PdfReader(f).pages)
+
+            selected = parse_pages_arg(jpeg_pages, total_pages)
+            jpgs = pdf_to_jpegs(pdf_path, jpeg_dpi, selected)
+
+            pdf_b = open(pdf_path, "rb").read()
+            return ok({
+                "file_name": (filename or "document").strip().rstrip(".") + ".pdf",
+                "pdf_data_uri": data_uri("application/pdf", pdf_b),
+                "jpeg_dpi": jpeg_dpi,
+                "jpeg_pages": selected,
+                "jpeg_data_uris": [{"page": p, "data_uri": data_uri("image/jpeg", b)} for p, b in jpgs],
+                "total_pdf_pages": total_pages
+            })
+    except Exception as e:
+        # 500 ではなく 400 を返す（Bubble 側で原因が見える）
+        return err(str(e), 400)
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", "8080"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, workers=1, lifespan="off")
