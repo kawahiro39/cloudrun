@@ -392,6 +392,7 @@ def docx_convert_tags_to_jinja(in_docx: str, out_docx: str) -> Dict[str, Optiona
             root = tree.getroot()
             _word_convert_placeholders(root, size_hints)
             tree.write(p, encoding="utf-8", xml_declaration=True)
+
         with zipfile.ZipFile(out_docx, 'w', zipfile.ZIP_DEFLATED) as zout:
             for root, _, files in os.walk(tmpdir):
                 for fn in files:
@@ -402,6 +403,7 @@ def docx_convert_tags_to_jinja(in_docx: str, out_docx: str) -> Dict[str, Optiona
     return size_hints
 
 def _word_replace_placeholder_with_drawing(root, nodes: List[Tuple[LET._Element, int, int]], start: int, end: int, drawing: LET._Element) -> bool:
+
     if not nodes:
         return False
     affected_runs: List[LET._Element] = []
@@ -867,6 +869,7 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                                     "var": var,
                                     "size_hint": size_hint,
                                 })
+
                                 c.attrib.pop("t", None)
                                 try: c.remove(is_node)
                                 except: pass
