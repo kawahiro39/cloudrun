@@ -43,8 +43,6 @@ VAR_NAME = r"[A-Za-z_][A-Za-z0-9_]*"
 IMG_KEY_PATTERN = re.compile(rf"^\{{\[(?P<var>{VAR_NAME})\](?::(?P<size>[^}}]+))?\}}$")
 TXT_KEY_PATTERN = re.compile(rf"^\{{(?P<var>{VAR_NAME})\}}$")
 IMG_TAG_PATTERN = re.compile(rf"\{{\[(?P<var>{VAR_NAME})\](?::(?P<size>[^}}]+))?\}}")
-IMG_TAG_INLINE = re.compile(rf"(?<!\{{)\{{\[\s*(?P<var>{VAR_NAME})\s*\](?::(?P<size>[^}}]+))?\}}(?!\}})")
-TXT_TAG_INLINE = re.compile(rf"(?<!\{{)\{{\s*(?P<var>{VAR_NAME})\s*\}}(?!\}})")
 MM_RE      = re.compile(r'^\s*(\d+(?:\.\d+)?)\s*mm\s*$', re.IGNORECASE)
 NUM_PLAIN  = re.compile(r'^\s*-?\d+(?:\.\d+)?\s*$')
 NUM_COMMA  = re.compile(r'^\s*-?\d{1,3}(?:,\d{3})+(?:\.\d+)?\s*$')
@@ -227,11 +225,6 @@ def docx_convert_tags_to_jinja(in_docx: str, out_docx: str) -> Dict[str, Optiona
         with zipfile.ZipFile(in_docx, 'r') as zin:
             zin.extractall(tmpdir)
         for p in _word_content_xmls(tmpdir):
-            parser = LET.XMLParser(remove_blank_text=False)
-            tree = LET.parse(p, parser)
-            root = tree.getroot()
-            _word_convert_placeholders(root, size_hints)
-            tree.write(p, encoding="utf-8", xml_declaration=True)
         with zipfile.ZipFile(out_docx, 'w', zipfile.ZIP_DEFLATED) as zout:
             for root, _, files in os.walk(tmpdir):
                 for fn in files:
@@ -439,8 +432,6 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
     """
     ns = {"s": S_NS}
     tmpdir = tempfile.mkdtemp()
-    placements: List[Dict[str, object]] = []
-    formula_cells: List[Dict[str, object]] = []
     try:
         with zipfile.ZipFile(src_xlsx, 'r') as zin:
             zin.extractall(tmpdir)
@@ -504,16 +495,6 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                     v_node = c.find("s:v", ns)
                     is_node = c.find("s:is", ns)
                     f_node = c.find("s:f", ns)
-                    r_attr = c.get("r") or ""
-
-                    if f_node is not None:
-                        formula_cells.append({
-                            "sheet_file": fn,
-                            "sheet_name": sheet_name,
-                            "sheet_index": sheet_index,
-                            "cell_ref": r_attr,
-                            "boolean": (c.get("t") == "b"),
-                        })
 
                     # 数式セルはキャッシュ値を削除し LibreOffice での再計算を確実化
                     if f_node is not None and v_node is not None:
@@ -527,15 +508,6 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                         except: sst_idx = None
                         if sst_idx is not None and sst_idx in img_sst_idx:
                             # 画像座標として記録してセルは空に
-                            var, size_hint = img_sst_idx[sst_idx]
-                            placements.append({
-                                "sheet_file": fn,
-                                "sheet_name": sheet_name,
-                                "sheet_index": sheet_index,
-                                "cell_ref": r_attr,
-                                "var": var,
-                                "size_hint": size_hint,
-                            })
                             c.attrib.pop("t", None)
                             c.remove(v_node)
                             continue
@@ -552,14 +524,6 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                             txt = t_inline.text
                             var, size_hint = parse_image_tag(txt or "")
                             if var:
-                                placements.append({
-                                    "sheet_file": fn,
-                                    "sheet_name": sheet_name,
-                                    "sheet_index": sheet_index,
-                                    "cell_ref": r_attr,
-                                    "var": var,
-                                    "size_hint": size_hint,
-                                })
                                 c.attrib.pop("t", None)
                                 try: c.remove(is_node)
                                 except: pass
@@ -604,13 +568,6 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
         import requests
 
         wb = load_workbook(dst_xlsx)
-        for item in placements:
-            sheet_file = item.get("sheet_file")
-            cell_ref = item.get("cell_ref")
-            var = item.get("var")
-            size_hint = item.get("size_hint")
-            sheet_index = item.get("sheet_index") or 0
-            sheet_name = item.get("sheet_name")
             meta = image_map.get(var)
             if not meta: continue
             url = meta["url"]
