@@ -204,6 +204,8 @@ def xlsx_force_full_recalc(extracted_dir: str):
     calcPr = root.find("s:calcPr", ns) or ET.SubElement(root, f"{{{ns['s']}}}calcPr")
     calcPr.set("calcMode", "auto")
     calcPr.set("fullCalcOnLoad", "1")
+    calcPr.set("calcOnSave", "1")
+    calcPr.set("forceFullCalc", "1")
     chain = os.path.join(extracted_dir, "xl", "calcChain.xml")
     if os.path.exists(chain):
         try: os.remove(chain)
@@ -275,6 +277,13 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                     t_attr = c.get("t")
                     v_node = c.find("s:v", ns)
                     is_node = c.find("s:is", ns)
+                    f_node = c.find("s:f", ns)
+
+                    # 数式セルはキャッシュ値を削除し LibreOffice での再計算を確実化
+                    if f_node is not None and v_node is not None:
+                        try: c.remove(v_node)
+                        except: pass
+                        v_node = None
 
                     # shared string
                     if t_attr == "s" and v_node is not None and v_node.text:
