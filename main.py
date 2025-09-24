@@ -9,7 +9,6 @@ import subprocess
 import xml.etree.ElementTree as ET
 from decimal import Decimal
 from lxml import etree as LET
-from jinja2 import Environment, DebugUndefined
 from typing import Dict, Tuple, List, Optional
 
 from fastapi import FastAPI, UploadFile, File, Form
@@ -44,8 +43,6 @@ VAR_NAME = r"[A-Za-z_][A-Za-z0-9_]*"
 IMG_KEY_PATTERN = re.compile(rf"^\{{\[(?P<var>{VAR_NAME})\](?::(?P<size>[^}}]+))?\}}$")
 TXT_KEY_PATTERN = re.compile(rf"^\{{(?P<var>{VAR_NAME})\}}$")
 IMG_TAG_PATTERN = re.compile(rf"\{{\[(?P<var>{VAR_NAME})\](?::(?P<size>[^}}]+))?\}}")
-IMG_TAG_INLINE = re.compile(rf"(?<!\{{)\{{\[\s*(?P<var>{VAR_NAME})\s*\](?::(?P<size>[^}}]+))?\}}(?!\}})")
-TXT_TAG_INLINE = re.compile(rf"(?<!\{{)\{{\s*(?P<var>{VAR_NAME})\s*\}}(?!\}})")
 MM_RE      = re.compile(r'^\s*(\d+(?:\.\d+)?)\s*mm\s*$', re.IGNORECASE)
 NUM_PLAIN  = re.compile(r'^\s*-?\d+(?:\.\d+)?\s*$')
 NUM_COMMA  = re.compile(r'^\s*-?\d{1,3}(?:,\d{3})+(?:\.\d+)?\s*$')
@@ -162,7 +159,6 @@ WORD_XML_TARGETS = ("word/document.xml","word/footnotes.xml","word/endnotes.xml"
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 S_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-XML_NS = "http://www.w3.org/XML/1998/namespace"
 
 def _word_collect_text_nodes(root) -> List[Tuple[LET._Element, int, int]]:
     nodes: List[Tuple[LET._Element, int, int]] = []
@@ -191,58 +187,6 @@ def _word_replace_range(root, start: int, end: int, replacement: str):
         else:
             node.text = before + after
 
-def _word_set_text(node: LET._Element, text: str):
-    run = node.getparent()
-    if run is None or run.tag != f"{{{W_NS}}}r":
-        node.text = text
-        return
-
-    children = list(run)
-    try:
-        idx = children.index(node)
-    except ValueError:
-        idx = -1
-
-    # remove text/break nodes after the current text node so we can rebuild
-    if idx >= 0:
-        for child in children[idx + 1:]:
-            if child.tag in {f"{{{W_NS}}}t", f"{{{W_NS}}}br"}:
-                run.remove(child)
-
-    parts = text.split("\n")
-    first = parts[0] if parts else ""
-    node.text = first
-    if first.strip() != first or "\n" in first or first == "":
-        node.set(f"{{{XML_NS}}}space", "preserve")
-    else:
-        node.attrib.pop(f"{{{XML_NS}}}space", None)
-
-    for part in parts[1:]:
-        br = LET.Element(f"{{{W_NS}}}br")
-        run.append(br)
-        t = LET.Element(f"{{{W_NS}}}t")
-        t.set(f"{{{XML_NS}}}space", "preserve")
-        t.text = part
-        run.append(t)
-
-def _word_replace_range_with_text(root, start: int, end: int, replacement: str):
-    nodes = _word_collect_text_nodes(root)
-    inserted = False
-    for node, node_start, node_end in nodes:
-        if node_end <= start or node_start >= end:
-            continue
-        text = node.text or ""
-        local_start = max(0, start - node_start)
-        local_end = min(len(text), end - node_start)
-        before = text[:local_start]
-        after = text[local_end:]
-        combined = before + replacement + after
-        if not inserted:
-            _word_set_text(node, combined)
-            inserted = True
-        else:
-            _word_set_text(node, before + after)
-
 def _word_convert_placeholders(root, size_hints: Dict[str, Optional[float]]):
     while True:
         nodes = _word_collect_text_nodes(root)
@@ -264,23 +208,6 @@ def _word_convert_placeholders(root, size_hints: Dict[str, Optional[float]]):
             continue
         break
 
-WORD_JINJA_PATTERN = re.compile(r"\{\{\s*(?P<var>%s)\s*\}\}" % VAR_NAME)
-
-def _word_apply_text_map(root, text_map: Dict[str, str]):
-    if not text_map:
-        return
-    while True:
-        nodes = _word_collect_text_nodes(root)
-        if not nodes:
-            break
-        full_text = "".join((node.text or "") for node, _, _ in nodes)
-        m = WORD_JINJA_PATTERN.search(full_text)
-        if not m:
-            break
-        var = m.group("var")
-        replacement = text_map.get(var, "")
-        _word_replace_range_with_text(root, m.start(), m.end(), replacement)
-
 def _word_content_xmls(extracted_dir: str) -> List[str]:
     targets = list(WORD_XML_TARGETS)
     wdir = os.path.join(extracted_dir, "word")
@@ -298,11 +225,6 @@ def docx_convert_tags_to_jinja(in_docx: str, out_docx: str) -> Dict[str, Optiona
         with zipfile.ZipFile(in_docx, 'r') as zin:
             zin.extractall(tmpdir)
         for p in _word_content_xmls(tmpdir):
-            parser = LET.XMLParser(remove_blank_text=False)
-            tree = LET.parse(p, parser)
-            root = tree.getroot()
-            _word_convert_placeholders(root, size_hints)
-            tree.write(p, encoding="utf-8", xml_declaration=True)
         with zipfile.ZipFile(out_docx, 'w', zipfile.ZIP_DEFLATED) as zout:
             for root, _, files in os.walk(tmpdir):
                 for fn in files:
@@ -329,8 +251,6 @@ def docx_render(in_docx: str, out_docx: str, text_map: Dict[str, str], image_map
         bio = io.BytesIO(r.content)
         mm = meta.get("mm") or size_hints.get(k)
         ctx[k] = InlineImage(doc, bio, width=Mm(mm)) if mm else InlineImage(doc, bio)
-    jinja_env = Environment(autoescape=False, undefined=DebugUndefined)
-    doc.render(ctx, jinja_env=jinja_env)
     doc.save(out_docx)
     os.remove(tmp)
 
@@ -513,8 +433,6 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
     """
     ns = {"s": S_NS}
     tmpdir = tempfile.mkdtemp()
-    placements: List[Dict[str, object]] = []
-    formula_cells: List[Dict[str, object]] = []
     try:
         with zipfile.ZipFile(src_xlsx, 'r') as zin:
             zin.extractall(tmpdir)
@@ -578,16 +496,6 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                     v_node = c.find("s:v", ns)
                     is_node = c.find("s:is", ns)
                     f_node = c.find("s:f", ns)
-                    r_attr = c.get("r") or ""
-
-                    if f_node is not None:
-                        formula_cells.append({
-                            "sheet_file": fn,
-                            "sheet_name": sheet_name,
-                            "sheet_index": sheet_index,
-                            "cell_ref": r_attr,
-                            "boolean": (c.get("t") == "b"),
-                        })
 
                     # 数式セルはキャッシュ値を削除し LibreOffice での再計算を確実化
                     if f_node is not None and v_node is not None:
@@ -601,15 +509,6 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                         except: sst_idx = None
                         if sst_idx is not None and sst_idx in img_sst_idx:
                             # 画像座標として記録してセルは空に
-                            var, size_hint = img_sst_idx[sst_idx]
-                            placements.append({
-                                "sheet_file": fn,
-                                "sheet_name": sheet_name,
-                                "sheet_index": sheet_index,
-                                "cell_ref": r_attr,
-                                "var": var,
-                                "size_hint": size_hint,
-                            })
                             c.attrib.pop("t", None)
                             c.remove(v_node)
                             continue
@@ -626,14 +525,6 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                             txt = t_inline.text
                             var, size_hint = parse_image_tag(txt or "")
                             if var:
-                                placements.append({
-                                    "sheet_file": fn,
-                                    "sheet_name": sheet_name,
-                                    "sheet_index": sheet_index,
-                                    "cell_ref": r_attr,
-                                    "var": var,
-                                    "size_hint": size_hint,
-                                })
                                 c.attrib.pop("t", None)
                                 try: c.remove(is_node)
                                 except: pass
@@ -678,13 +569,6 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
         import requests
 
         wb = load_workbook(dst_xlsx)
-        for item in placements:
-            sheet_file = item.get("sheet_file")
-            cell_ref = item.get("cell_ref")
-            var = item.get("var")
-            size_hint = item.get("size_hint")
-            sheet_index = item.get("sheet_index") or 0
-            sheet_name = item.get("sheet_name")
             meta = image_map.get(var)
             if not meta: continue
             url = meta["url"]
