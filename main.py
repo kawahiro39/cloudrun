@@ -40,6 +40,9 @@ def err(m, status=400): return JSONResponse(status_code=status, content={"error"
 VAR_NAME = r"[A-Za-z_][A-Za-z0-9_]*"
 IMG_KEY_PATTERN = re.compile(rf"^\{{\[(?P<var>{VAR_NAME})\](?::(?P<size>[^}}]+))?\}}$")
 TXT_KEY_PATTERN = re.compile(rf"^\{{(?P<var>{VAR_NAME})\}}$")
+IMG_TAG_PATTERN = re.compile(rf"\{{\[(?P<var>{VAR_NAME})\](?::(?P<size>[^}}]+))?\}}")
+IMG_TAG_INLINE = re.compile(rf"(?<!\{{)\{{\[\s*(?P<var>{VAR_NAME})\s*(?::(?P<size>[^}}]+))?\]\}}(?!\}})")
+TXT_TAG_INLINE = re.compile(rf"(?<!\{{)\{{\s*(?P<var>{VAR_NAME})\s*\}}(?!\}})")
 MM_RE      = re.compile(r'^\s*(\d+(?:\.\d+)?)\s*mm\s*$', re.IGNORECASE)
 NUM_PLAIN  = re.compile(r'^\s*-?\d+(?:\.\d+)?\s*$')
 NUM_COMMA  = re.compile(r'^\s*-?\d{1,3}(?:,\d{3})+(?:\.\d+)?\s*$')
@@ -48,6 +51,12 @@ NUM_PCT    = re.compile(r'^\s*-?\d+(?:\.\d+)?\s*%\s*$')
 def parse_size_mm(s: Optional[str]) -> Optional[float]:
     if not s: return None
     m = MM_RE.match(s.strip()); return float(m.group(1)) if m else None
+
+def parse_image_tag(text: Optional[str]) -> Tuple[Optional[str], Optional[float]]:
+    if not text: return None, None
+    m = IMG_TAG_PATTERN.fullmatch(text.strip())
+    if not m: return None, None
+    return m.group("var"), parse_size_mm(m.group("size") or "")
 
 def parse_numberlike(s: str) -> Tuple[Optional[float], Optional[str]]:
     if s is None: return None, None
@@ -129,6 +138,55 @@ def parse_pages_arg(pages: str, total_pages: int) -> List[int]:
 
 # ------------ Word (.docx) ------------
 WORD_XML_TARGETS = ("word/document.xml","word/footnotes.xml","word/endnotes.xml","word/comments.xml")
+W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+def _word_collect_text_nodes(root) -> List[Tuple[ET.Element, int, int]]:
+    nodes: List[Tuple[ET.Element, int, int]] = []
+    cursor = 0
+    for t in root.iter(f"{{{W_NS}}}t"):
+        text = t.text or ""
+        start = cursor
+        cursor += len(text)
+        nodes.append((t, start, cursor))
+    return nodes
+
+def _word_replace_range(root, start: int, end: int, replacement: str):
+    nodes = _word_collect_text_nodes(root)
+    inserted = False
+    for node, node_start, node_end in nodes:
+        if node_end <= start or node_start >= end:
+            continue
+        text = node.text or ""
+        local_start = max(0, start - node_start)
+        local_end = min(len(text), end - node_start)
+        before = text[:local_start]
+        after = text[local_end:]
+        if not inserted:
+            node.text = before + replacement + after
+            inserted = True
+        else:
+            node.text = before + after
+
+def _word_convert_placeholders(root, size_hints: Dict[str, Optional[float]]):
+    while True:
+        nodes = _word_collect_text_nodes(root)
+        if not nodes:
+            break
+        full_text = "".join((node.text or "") for node, _, _ in nodes)
+        m_img = IMG_TAG_INLINE.search(full_text)
+        if m_img:
+            var = m_img.group("var")
+            size = parse_size_mm(m_img.group("size") or "")
+            if size is not None:
+                size_hints.setdefault(var, size)
+            _word_replace_range(root, m_img.start(), m_img.end(), f"{{{{ {var} }}}}")
+            continue
+        m_txt = TXT_TAG_INLINE.search(full_text)
+        if m_txt:
+            var = m_txt.group("var")
+            _word_replace_range(root, m_txt.start(), m_txt.end(), f"{{{{ {var} }}}}")
+            continue
+        break
 
 def _word_content_xmls(extracted_dir: str) -> List[str]:
     targets = list(WORD_XML_TARGETS)
@@ -139,17 +197,18 @@ def _word_content_xmls(extracted_dir: str) -> List[str]:
             if fn.startswith("footer") and fn.endswith(".xml"): targets.append(f"word/{fn}")
     return [os.path.join(extracted_dir, p) for p in targets if os.path.exists(os.path.join(extracted_dir, p))]
 
-def docx_convert_tags_to_jinja(in_docx: str, out_docx: str):
+def docx_convert_tags_to_jinja(in_docx: str, out_docx: str) -> Dict[str, Optional[float]]:
     # {var}/{[var]} → {{ var }} へ。英数字+下線のタグのみ変換（Jinja誤爆防止）
     tmpdir = tempfile.mkdtemp()
+    size_hints: Dict[str, Optional[float]] = {}
     try:
         with zipfile.ZipFile(in_docx, 'r') as zin:
             zin.extractall(tmpdir)
         for p in _word_content_xmls(tmpdir):
-            s = open(p, "r", encoding="utf-8").read()
-            s = re.sub(rf"\{{\[\s*({VAR_NAME})\s*\]\}}", r"{{ \1 }}", s)
-            s = re.sub(rf"\{{\s*({VAR_NAME})\s*\}}",       r"{{ \1 }}", s)
-            open(p, "w", encoding="utf-8").write(s)
+            tree = ET.parse(p)
+            root = tree.getroot()
+            _word_convert_placeholders(root, size_hints)
+            tree.write(p, encoding="utf-8", xml_declaration=True)
         with zipfile.ZipFile(out_docx, 'w', zipfile.ZIP_DEFLATED) as zout:
             for root, _, files in os.walk(tmpdir):
                 for fn in files:
@@ -157,6 +216,7 @@ def docx_convert_tags_to_jinja(in_docx: str, out_docx: str):
                     zout.write(full, os.path.relpath(full, tmpdir))
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+    return size_hints
 
 def docx_render(in_docx: str, out_docx: str, text_map: Dict[str, str], image_map: Dict[str, Dict]):
     from docxtpl import DocxTemplate, InlineImage
@@ -164,7 +224,7 @@ def docx_render(in_docx: str, out_docx: str, text_map: Dict[str, str], image_map
     import requests
 
     tmp = in_docx + ".jinja.docx"
-    docx_convert_tags_to_jinja(in_docx, tmp)
+    size_hints = docx_convert_tags_to_jinja(in_docx, tmp)
 
     doc = DocxTemplate(tmp)
     ctx: Dict[str, object] = {}
@@ -172,7 +232,8 @@ def docx_render(in_docx: str, out_docx: str, text_map: Dict[str, str], image_map
     for k, meta in image_map.items():
         r = requests.get(meta["url"], timeout=20); r.raise_for_status()
         bio = io.BytesIO(r.content)
-        ctx[k] = InlineImage(doc, bio, width=Mm(meta["mm"])) if meta.get("mm") else InlineImage(doc, bio)
+        mm = meta.get("mm") or size_hints.get(k)
+        ctx[k] = InlineImage(doc, bio, width=Mm(mm)) if mm else InlineImage(doc, bio)
     doc.render(ctx)
     doc.save(out_docx)
     os.remove(tmp)
@@ -204,6 +265,8 @@ def xlsx_force_full_recalc(extracted_dir: str):
     calcPr = root.find("s:calcPr", ns) or ET.SubElement(root, f"{{{ns['s']}}}calcPr")
     calcPr.set("calcMode", "auto")
     calcPr.set("fullCalcOnLoad", "1")
+    calcPr.set("calcOnSave", "1")
+    calcPr.set("forceFullCalc", "1")
     chain = os.path.join(extracted_dir, "xl", "calcChain.xml")
     if os.path.exists(chain):
         try: os.remove(chain)
@@ -218,7 +281,7 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
     """
     ns = {"s":"http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
     tmpdir = tempfile.mkdtemp()
-    placements: List[Tuple[str, str, str]] = []  # (sheet_file, cell_ref, var)
+    placements: List[Tuple[str, str, str, Optional[float]]] = []  # (sheet_file, cell_ref, var, mm_hint)
     try:
         with zipfile.ZipFile(src_xlsx, 'r') as zin:
             zin.extractall(tmpdir)
@@ -226,7 +289,7 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
         # sharedStrings
         sst_path = os.path.join(tmpdir, "xl", "sharedStrings.xml")
         numeric_candidates: Dict[int, Tuple[bool, Optional[float]]] = {}
-        img_sst_idx: Dict[int, str] = {}
+        img_sst_idx: Dict[int, Tuple[str, Optional[float]]] = {}
 
         if os.path.exists(sst_path):
             tree = ET.parse(sst_path); root = tree.getroot(); idx = -1
@@ -239,9 +302,9 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                     original = "".join([(r.find("s:t", ns).text or "") for r in si.findall("s:r", ns) if r.find("s:t", ns) is not None])
 
                 # 画像タグ？
-                m_img = re.fullmatch(rf"\{{\[\s*({VAR_NAME})\s*\]\}}", original or "")
-                if m_img:
-                    img_sst_idx[idx] = m_img.group(1)
+                var, size_hint = parse_image_tag(original or "")
+                if var:
+                    img_sst_idx[idx] = (var, size_hint)
                     for r in list(si): si.remove(r)
                     t = ET.SubElement(si, f"{{{ns['s']}}}t"); t.text = ""
                     continue
@@ -275,6 +338,13 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                     t_attr = c.get("t")
                     v_node = c.find("s:v", ns)
                     is_node = c.find("s:is", ns)
+                    f_node = c.find("s:f", ns)
+
+                    # 数式セルはキャッシュ値を削除し LibreOffice での再計算を確実化
+                    if f_node is not None and v_node is not None:
+                        try: c.remove(v_node)
+                        except: pass
+                        v_node = None
 
                     # shared string
                     if t_attr == "s" and v_node is not None and v_node.text:
@@ -283,7 +353,8 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                         if sst_idx is not None and sst_idx in img_sst_idx:
                             # 画像座標として記録してセルは空に
                             r_attr = c.get("r") or ""
-                            placements.append((fn, r_attr, img_sst_idx[sst_idx]))
+                            var, size_hint = img_sst_idx[sst_idx]
+                            placements.append((fn, r_attr, var, size_hint))
                             c.attrib.pop("t", None)
                             c.remove(v_node)
                             continue
@@ -298,10 +369,10 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                         t_inline = is_node.find("s:t", ns)
                         if t_inline is not None and t_inline.text is not None:
                             txt = t_inline.text
-                            m_img = re.fullmatch(rf"\{{\[\s*({VAR_NAME})\s*\]\}}", txt or "")
-                            if m_img:
+                            var, size_hint = parse_image_tag(txt or "")
+                            if var:
                                 r_attr = c.get("r") or ""
-                                placements.append((fn, r_attr, m_img.group(1)))
+                                placements.append((fn, r_attr, var, size_hint))
                                 c.attrib.pop("t", None)
                                 try: c.remove(is_node)
                                 except: pass
@@ -346,10 +417,11 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
         import requests
 
         wb = load_workbook(dst_xlsx)
-        for sheet_file, cell_ref, var in placements:
+        for sheet_file, cell_ref, var, size_hint in placements:
             meta = image_map.get(var)
             if not meta: continue
-            url = meta["url"]; mm = meta.get("mm")
+            url = meta["url"]
+            mm = meta.get("mm") or size_hint
             r = requests.get(url, timeout=20); r.raise_for_status()
             img = PILImage.open(io.BytesIO(r.content)).convert("RGBA")
             if mm:
