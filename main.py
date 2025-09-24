@@ -44,8 +44,9 @@ VAR_NAME = r"[A-Za-z_][A-Za-z0-9_]*"
 IMG_KEY_PATTERN = re.compile(rf"^\{{\[(?P<var>{VAR_NAME})\](?::(?P<size>[^}}]+))?\}}$")
 TXT_KEY_PATTERN = re.compile(rf"^\{{(?P<var>{VAR_NAME})\}}$")
 IMG_TAG_PATTERN = re.compile(rf"\{{\[(?P<var>{VAR_NAME})\](?::(?P<size>[^}}]+))?\}}")
-IMG_TAG_INLINE = re.compile(rf"(?<!\{{)\{{\[\s*(?P<var>{VAR_NAME})\s*\](?::(?P<size>[^}}]+))?\}}(?!\}})")
-TXT_TAG_INLINE = re.compile(rf"(?<!\{{)\{{\s*(?P<var>{VAR_NAME})\s*\}}(?!\}})")
+WORD_INLINE_PATTERN = re.compile(
+    rf"(?<!\{{)\{{\s*(?:\[\s*(?P<img>{VAR_NAME})\s*\](?::(?P<size>[^}}]+))?|(?P<txt>{VAR_NAME}))\s*\}}(?!\}})"
+)
 MM_RE      = re.compile(r'^\s*(\d+(?:\.\d+)?)\s*mm\s*$', re.IGNORECASE)
 NUM_PLAIN  = re.compile(r'^\s*-?\d+(?:\.\d+)?\s*$')
 NUM_COMMA  = re.compile(r'^\s*-?\d{1,3}(?:,\d{3})+(?:\.\d+)?\s*$')
@@ -135,6 +136,14 @@ def parse_mapping_text(raw: str) -> Tuple[Dict[str, str], Dict[str, Dict]]:
 
     return text_map, image_map
 
+def _apply_text_tokens(text: Optional[str], text_map: Dict[str, str]) -> Optional[str]:
+    if text is None or not text_map:
+        return text
+    result = text
+    for key, value in text_map.items():
+        result = result.replace(f"{{{key}}}", value)
+    return result
+
 def mm_to_pixels(mm: float, dpi: int = 96) -> int:
     return int(round(mm / 25.4 * dpi))
 
@@ -168,33 +177,6 @@ A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
 PIC_NS = "http://schemas.openxmlformats.org/drawingml/2006/picture"
 XML_NS = "http://www.w3.org/XML/1998/namespace"
 EMU_PER_INCH = 914400
-
-def _word_collect_text_nodes(root) -> List[Tuple[LET._Element, int, int]]:
-    nodes: List[Tuple[LET._Element, int, int]] = []
-    cursor = 0
-    for t in root.iter(f"{{{W_NS}}}t"):
-        text = t.text or ""
-        start = cursor
-        cursor += len(text)
-        nodes.append((t, start, cursor))
-    return nodes
-
-def _word_replace_range(root, start: int, end: int, replacement: str):
-    nodes = _word_collect_text_nodes(root)
-    inserted = False
-    for node, node_start, node_end in nodes:
-        if node_end <= start or node_start >= end:
-            continue
-        text = node.text or ""
-        local_start = max(0, start - node_start)
-        local_end = min(len(text), end - node_start)
-        before = text[:local_start]
-        after = text[local_end:]
-        if not inserted:
-            node.text = before + replacement + after
-            inserted = True
-        else:
-            node.text = before + after
 
 def _word_set_text(node: LET._Element, text: str):
     run = node.getparent()
@@ -230,8 +212,19 @@ def _word_set_text(node: LET._Element, text: str):
         t.text = part
         run.append(t)
 
-def _word_replace_range_with_text(root, start: int, end: int, replacement: str):
-    nodes = _word_collect_text_nodes(root)
+def _word_snapshot(root) -> Tuple[List[Tuple[LET._Element, int, int]], str]:
+    nodes: List[Tuple[LET._Element, int, int]] = []
+    cursor = 0
+    parts: List[str] = []
+    for t in root.iter(f"{{{W_NS}}}t"):
+        text = t.text or ""
+        start = cursor
+        cursor += len(text)
+        nodes.append((t, start, cursor))
+        parts.append(text)
+    return nodes, "".join(parts)
+
+def _word_splice_text(nodes: List[Tuple[LET._Element, int, int]], start: int, end: int, replacement: str, preserve: bool = False):
     inserted = False
     for node, node_start, node_end in nodes:
         if node_end <= start or node_start >= end:
@@ -241,50 +234,56 @@ def _word_replace_range_with_text(root, start: int, end: int, replacement: str):
         local_end = min(len(text), end - node_start)
         before = text[:local_start]
         after = text[local_end:]
-        combined = before + replacement + after
+        new_value = before + replacement + after
         if not inserted:
-            _word_set_text(node, combined)
+            if preserve:
+                _word_set_text(node, new_value)
+            else:
+                node.text = new_value
             inserted = True
         else:
-            _word_set_text(node, before + after)
+            remainder = before + after
+            if preserve:
+                _word_set_text(node, remainder)
+            else:
+                node.text = remainder
 
 def _word_convert_placeholders(root, size_hints: Dict[str, Optional[float]]):
     while True:
-        nodes = _word_collect_text_nodes(root)
+        nodes, full_text = _word_snapshot(root)
         if not nodes:
             break
-        full_text = "".join((node.text or "") for node, _, _ in nodes)
-        m_img = IMG_TAG_INLINE.search(full_text)
-        if m_img:
-            var = m_img.group("var")
-            size = parse_size_mm(m_img.group("size") or "")
+        match = WORD_INLINE_PATTERN.search(full_text)
+        if not match:
+            break
+        var = match.group("img") or match.group("txt")
+        if not var:
+            break
+        if match.group("img"):
+            size = parse_size_mm(match.group("size") or "")
             if size is not None:
                 size_hints.setdefault(var, size)
-            _word_replace_range(root, m_img.start(), m_img.end(), f"{{{{ {var} }}}}")
-            continue
-        m_txt = TXT_TAG_INLINE.search(full_text)
-        if m_txt:
-            var = m_txt.group("var")
-            _word_replace_range(root, m_txt.start(), m_txt.end(), f"{{{{ {var} }}}}")
-            continue
-        break
+        _word_splice_text(nodes, match.start(), match.end(), f"{{{{ {var} }}}}")
 
 WORD_JINJA_PATTERN = re.compile(r"\{\{\s*(?P<var>%s)\s*\}\}" % VAR_NAME)
 
 def _word_apply_text_map(root, text_map: Dict[str, str]):
     if not text_map:
         return
-    for var, replacement in text_map.items():
-        pattern = re.compile(r"\{\{\s*%s\s*\}\}" % re.escape(var))
-        while True:
-            nodes = _word_collect_text_nodes(root)
-            if not nodes:
+    while True:
+        nodes, full_text = _word_snapshot(root)
+        if not nodes:
+            break
+        target = None
+        for m in WORD_JINJA_PATTERN.finditer(full_text):
+            var = m.group("var")
+            if var in text_map:
+                target = (m.start(), m.end(), text_map[var])
                 break
-            full_text = "".join((node.text or "") for node, _, _ in nodes)
-            m = pattern.search(full_text)
-            if not m:
-                break
-            _word_replace_range_with_text(root, m.start(), m.end(), replacement)
+        if not target:
+            break
+        start, end, replacement = target
+        _word_splice_text(nodes, start, end, replacement, preserve=True)
 
 def _word_part_rels_path(xml_path: str) -> str:
     base = os.path.basename(xml_path)
@@ -403,8 +402,8 @@ def docx_convert_tags_to_jinja(in_docx: str, out_docx: str) -> Dict[str, Optiona
         shutil.rmtree(tmpdir, ignore_errors=True)
     return size_hints
 
-def _word_replace_placeholder_with_drawing(root, start: int, end: int, drawing: LET._Element) -> bool:
-    nodes = _word_collect_text_nodes(root)
+def _word_replace_placeholder_with_drawing(root, nodes: List[Tuple[LET._Element, int, int]], start: int, end: int, drawing: LET._Element) -> bool:
+
     if not nodes:
         return False
     affected_runs: List[LET._Element] = []
@@ -502,17 +501,16 @@ def _word_apply_images(root, rels_tree: LET._ElementTree, assets: Dict[str, Dict
     for var, asset in assets.items():
         pattern = re.compile(r"\{\{\s*%s\s*\}\}" % re.escape(var))
         while True:
-            nodes = _word_collect_text_nodes(root)
+            nodes, full_text = _word_snapshot(root)
             if not nodes:
                 break
-            full_text = "".join((node.text or "") for node, _, _ in nodes)
             m = pattern.search(full_text)
             if not m:
                 break
             rid, rel_elem = _word_add_image_relationship(rels_root, asset["target"])
             docpr_id = _word_next_docpr(docpr_counter)
             drawing = _word_make_inline_drawing(rid, docpr_id, int(asset.get("cx", 1)), int(asset.get("cy", 1)))
-            if _word_replace_placeholder_with_drawing(root, m.start(), m.end(), drawing):
+            if _word_replace_placeholder_with_drawing(root, nodes, m.start(), m.end(), drawing):
                 changed = True
                 used.append(var)
             else:
@@ -560,7 +558,6 @@ def _word_postprocess_docx(docx_path: str, text_map: Dict[str, str], assets: Dic
                     zout.write(full, os.path.relpath(full, tmpdir))
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
-
 
 def docx_render(in_docx: str, out_docx: str, text_map: Dict[str, str], image_map: Dict[str, Dict]):
     from docxtpl import DocxTemplate, InlineImage
@@ -780,19 +777,20 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                     continue
 
                 # テキスト置換
-                replaced = original
-                for k, v in text_map.items(): replaced = replaced.replace(f"{{{k}}}", _with_newlines(v))
+                replaced = _apply_text_tokens(original, text_map)
 
                 # 書き戻し
                 for r in list(si): si.remove(r)
                 t = ET.SubElement(si, f"{{{ns['s']}}}t"); t.text = replaced
 
                 # 完全一致 = 数値候補
-                for k, v in text_map.items():
-                    if original == f"{{{k}}}":
-                        num, _ = parse_numberlike(v)
+                txt_match = TXT_KEY_PATTERN.match(original or "")
+                if txt_match:
+                    var_name = txt_match.group("var")
+                    mapped = text_map.get(var_name)
+                    if mapped is not None:
+                        num, _ = parse_numberlike(mapped)
                         numeric_candidates[idx] = ((num is not None), num)
-                        break
 
             tree.write(sst_path, encoding="utf-8", xml_declaration=True)
 
@@ -847,7 +845,6 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                                 "var": var,
                                 "size_hint": size_hint,
                             })
-
                             c.attrib.pop("t", None)
                             c.remove(v_node)
                             continue
@@ -880,20 +877,20 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                                     c.remove(v_node)
                                 continue
                             # テキスト置換／数値化
-                            replaced = txt
-                            for k, v in text_map.items(): replaced = replaced.replace(f"{{{k}}}", _with_newlines(v))
-                            for k, v in text_map.items():
-                                if txt == f"{{{k}}}":
-                                    num, _ = parse_numberlike(v)
+                            tag_match = TXT_KEY_PATTERN.match(txt or "")
+                            if tag_match:
+                                mapped = text_map.get(tag_match.group("var"))
+                                if mapped is not None:
+                                    num, _ = parse_numberlike(mapped)
                                     if num is not None:
                                         c.set("t", "n")
                                         try: c.remove(is_node)
                                         except: pass
                                         if v_node is None: v_node = ET.SubElement(c, f"{{{ns['s']}}}v")
                                         v_node.text = str(num)
-                                        break
-                            else:
-                                t_inline.text = replaced
+                                        continue
+                            replaced = _apply_text_tokens(txt, text_map)
+                            t_inline.text = replaced
 
                 tree.write(p, encoding="utf-8", xml_declaration=True)
 
@@ -924,7 +921,6 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
             size_hint = item.get("size_hint")
             sheet_index = item.get("sheet_index") or 0
             sheet_name = item.get("sheet_name")
-
             meta = image_map.get(var)
             if not meta: continue
             url = meta["url"]
