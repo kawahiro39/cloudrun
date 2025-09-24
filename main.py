@@ -7,6 +7,7 @@ import zipfile
 import shutil
 import subprocess
 import xml.etree.ElementTree as ET
+from decimal import Decimal
 from lxml import etree as LET
 from typing import Dict, Tuple, List, Optional
 
@@ -42,7 +43,7 @@ VAR_NAME = r"[A-Za-z_][A-Za-z0-9_]*"
 IMG_KEY_PATTERN = re.compile(rf"^\{{\[(?P<var>{VAR_NAME})\](?::(?P<size>[^}}]+))?\}}$")
 TXT_KEY_PATTERN = re.compile(rf"^\{{(?P<var>{VAR_NAME})\}}$")
 IMG_TAG_PATTERN = re.compile(rf"\{{\[(?P<var>{VAR_NAME})\](?::(?P<size>[^}}]+))?\}}")
-IMG_TAG_INLINE = re.compile(rf"(?<!\{{)\{{\[\s*(?P<var>{VAR_NAME})\s*(?::(?P<size>[^}}]+))?\]\}}(?!\}})")
+IMG_TAG_INLINE = re.compile(rf"(?<!\{{)\{{\[\s*(?P<var>{VAR_NAME})\s*\](?::(?P<size>[^}}]+))?\}}(?!\}})")
 TXT_TAG_INLINE = re.compile(rf"(?<!\{{)\{{\s*(?P<var>{VAR_NAME})\s*\}}(?!\}})")
 MM_RE      = re.compile(r'^\s*(\d+(?:\.\d+)?)\s*mm\s*$', re.IGNORECASE)
 NUM_PLAIN  = re.compile(r'^\s*-?\d+(?:\.\d+)?\s*$')
@@ -76,6 +77,20 @@ def parse_numberlike(s: str) -> Tuple[Optional[float], Optional[str]]:
         except: return None, None
     return None, None
 
+def _format_formula_value(value) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        if value == value.to_integral():
+            value = int(value)
+        else:
+            value = float(value)
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return str(value)
+
 def _with_newlines(v: str) -> str:
     return (v or "").replace("<br>", "\n")
 
@@ -100,9 +115,13 @@ def parse_mapping_text(raw: str) -> Tuple[Dict[str, str], Dict[str, Dict]]:
             if seg: items.append(seg.replace(SAFE, "://"))
 
     for seg in items:
-        if ":" not in seg: continue
-        key, value = seg.split(":", 1)
-        key = key.strip(); value = value.strip()
+        if "}" not in seg:
+            continue
+        close = seg.find("}")
+        key = seg[:close+1].strip()
+        value = seg[close+1:].lstrip(":").strip()
+        if not key:
+            continue
 
         m_img = IMG_KEY_PATTERN.match(key)
         if m_img:
@@ -140,6 +159,8 @@ def parse_pages_arg(pages: str, total_pages: int) -> List[int]:
 # ------------ Word (.docx) ------------
 WORD_XML_TARGETS = ("word/document.xml","word/footnotes.xml","word/endnotes.xml","word/comments.xml")
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+S_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 
 def _word_collect_text_nodes(root) -> List[Tuple[LET._Element, int, int]]:
     nodes: List[Tuple[LET._Element, int, int]] = []
@@ -259,10 +280,41 @@ def docx_render(in_docx: str, out_docx: str, text_map: Dict[str, str], image_map
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 # ------------ Excel (.xlsx) ------------
+def _xlsx_sheet_map(extracted_dir: str) -> Dict[str, Tuple[Optional[str], Optional[int]]]:
+    mapping: Dict[str, Tuple[Optional[str], Optional[int]]] = {}
+    workbook_xml = os.path.join(extracted_dir, "xl", "workbook.xml")
+    rels_xml = os.path.join(extracted_dir, "xl", "_rels", "workbook.xml.rels")
+    if not os.path.exists(workbook_xml):
+        return mapping
+
+    rid_to_target: Dict[str, str] = {}
+    if os.path.exists(rels_xml):
+        tree = ET.parse(rels_xml); root = tree.getroot()
+        for rel in root.findall(f".//{{{R_NS}}}Relationship"):
+            if rel.get("Type", "").endswith("/worksheet"):
+                rid = rel.get("Id"); target = rel.get("Target")
+                if rid and target:
+                    rid_to_target[rid] = target.replace('\\', '/')
+
+    ns = {"s": S_NS, "r": R_NS}
+    tree = ET.parse(workbook_xml); root = tree.getroot()
+    sheets = root.find("s:sheets", ns)
+    if sheets is None:
+        return mapping
+    for idx, sheet in enumerate(sheets.findall("s:sheet", ns)):
+        name = sheet.get("name")
+        rid = sheet.get(f"{{{R_NS}}}id")
+        target = rid_to_target.get(rid or "")
+        if target:
+            rel_path = os.path.normpath(os.path.join("xl", target))
+            basename = os.path.basename(rel_path)
+            mapping[basename] = (name, idx)
+    return mapping
+
 def xlsx_force_full_recalc(extracted_dir: str):
     p = os.path.join(extracted_dir, "xl", "workbook.xml")
     if not os.path.exists(p): return
-    ns = {"s":"http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    ns = {"s": S_NS}
     tree = ET.parse(p); root = tree.getroot()
     calcPr = root.find("s:calcPr", ns) or ET.SubElement(root, f"{{{ns['s']}}}calcPr")
     calcPr.set("calcMode", "auto")
@@ -275,15 +327,120 @@ def xlsx_force_full_recalc(extracted_dir: str):
         except: pass
     tree.write(p, encoding="utf-8", xml_declaration=True)
 
+def _xlsx_escape_sheet_name(name: str) -> str:
+    if not name:
+        return ""
+    if re.search(r"[\s'!]", name):
+        return "'" + name.replace("'", "''") + "'"
+    return name
+
+def xlsx_update_formula_caches(xlsx_path: str, formula_cells: List[Dict]):
+    if not formula_cells:
+        return
+    try:
+        from xlcalculator import ModelCompiler, Evaluator
+    except Exception:
+        return
+
+    try:
+        compiler = ModelCompiler()
+        model = compiler.read_and_parse_archive(xlsx_path)
+        evaluator = Evaluator(model)
+    except Exception:
+        return
+
+    computed: Dict[Tuple[str, str], Optional[str]] = {}
+    sheet_names_by_index: List[str] = []
+    try:
+        # model.cells keys look like "Sheet!A1"; derive sheet list lazily
+        seen = []
+        for key in model.cells.keys():
+            sheet_part = key.split("!", 1)[0]
+            if sheet_part not in seen:
+                seen.append(sheet_part)
+        sheet_names_by_index = seen
+    except Exception:
+        sheet_names_by_index = []
+
+    for info in formula_cells:
+        cell_ref = info.get("cell_ref")
+        sheet_file = info.get("sheet_file")
+        sheet_name = info.get("sheet_name")
+        sheet_index = info.get("sheet_index")
+        if not cell_ref or not sheet_file:
+            continue
+        if not sheet_name and sheet_index is not None and 0 <= sheet_index < len(sheet_names_by_index):
+            sheet_name = sheet_names_by_index[sheet_index]
+        if not sheet_name:
+            continue
+        address = f"{_xlsx_escape_sheet_name(sheet_name)}!{cell_ref}"
+        try:
+            value = evaluator.evaluate(address)
+        except Exception:
+            continue
+        if hasattr(value, "value"):
+            value = value.value
+        formatted = _format_formula_value(value)
+        if formatted is None:
+            continue
+        computed[(sheet_file, cell_ref)] = formatted
+
+    if not computed:
+        return
+
+    tmpdir = tempfile.mkdtemp()
+    try:
+        with zipfile.ZipFile(xlsx_path, 'r') as zin:
+            zin.extractall(tmpdir)
+        ns = {"s": S_NS}
+        updated: Dict[str, ET.ElementTree] = {}
+        for info in formula_cells:
+            sheet_file = info.get("sheet_file")
+            cell_ref = info.get("cell_ref")
+            if not sheet_file or not cell_ref:
+                continue
+            key = (sheet_file, cell_ref)
+            if key not in computed:
+                continue
+            sheet_path = os.path.join(tmpdir, "xl", "worksheets", sheet_file)
+            if not os.path.exists(sheet_path):
+                continue
+            if sheet_file not in updated:
+                updated[sheet_file] = ET.parse(sheet_path)
+            tree = updated[sheet_file]
+            root = tree.getroot()
+            cell = root.find(f".//s:c[@r='{cell_ref}']", ns)
+            if cell is None:
+                continue
+            v_node = cell.find("s:v", ns)
+            if v_node is None:
+                v_node = ET.SubElement(cell, f"{{{ns['s']}}}v")
+            v_node.text = computed[key]
+            if computed[key] in ("1", "0") and info.get("boolean", False):
+                cell.set("t", "b")
+            elif cell.get("t") == "str":
+                cell.attrib.pop("t")
+        for sheet_file, tree in updated.items():
+            sheet_path = os.path.join(tmpdir, "xl", "worksheets", sheet_file)
+            tree.write(sheet_path, encoding="utf-8", xml_declaration=True)
+        with zipfile.ZipFile(xlsx_path, 'w', zipfile.ZIP_DEFLATED) as zout:
+            for root_dir, _, files in os.walk(tmpdir):
+                for fn in files:
+                    full = os.path.join(root_dir, fn)
+                    zout.write(full, os.path.relpath(full, tmpdir))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
 def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str], image_map: Dict[str, Dict]):
     """
     1) XML直編集で {var} を置換（完全一致は数値化、<br>→\n）、{[img]} はセルから除去し placements に記録
     2) fullCalcOnLoad=1 で再計算
     3) openpyxl で placements に新規画像挿入（既存図形/グラフは原則維持）
     """
-    ns = {"s":"http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    ns = {"s": S_NS}
     tmpdir = tempfile.mkdtemp()
-    placements: List[Tuple[str, str, str, Optional[float]]] = []  # (sheet_file, cell_ref, var, mm_hint)
+    placements: List[Dict[str, object]] = []
+    formula_cells: List[Dict[str, object]] = []
     try:
         with zipfile.ZipFile(src_xlsx, 'r') as zin:
             zin.extractall(tmpdir)
@@ -330,17 +487,33 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
 
         # worksheets
         ws_dir = os.path.join(tmpdir, "xl", "worksheets")
+        sheet_map = _xlsx_sheet_map(tmpdir)
         if os.path.isdir(ws_dir):
             for fn in os.listdir(ws_dir):
                 if not fn.endswith(".xml"): continue
                 p = os.path.join(ws_dir, fn)
                 tree = ET.parse(p); root = tree.getroot()
 
+                sheet_name, sheet_index = sheet_map.get(fn, (None, None))
+                if sheet_index is None:
+                    m = re.findall(r'\d+', fn)
+                    sheet_index = int(m[0]) - 1 if m else 0
+
                 for c in root.findall(".//s:c", ns):
                     t_attr = c.get("t")
                     v_node = c.find("s:v", ns)
                     is_node = c.find("s:is", ns)
                     f_node = c.find("s:f", ns)
+                    r_attr = c.get("r") or ""
+
+                    if f_node is not None:
+                        formula_cells.append({
+                            "sheet_file": fn,
+                            "sheet_name": sheet_name,
+                            "sheet_index": sheet_index,
+                            "cell_ref": r_attr,
+                            "boolean": (c.get("t") == "b"),
+                        })
 
                     # 数式セルはキャッシュ値を削除し LibreOffice での再計算を確実化
                     if f_node is not None and v_node is not None:
@@ -354,9 +527,15 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                         except: sst_idx = None
                         if sst_idx is not None and sst_idx in img_sst_idx:
                             # 画像座標として記録してセルは空に
-                            r_attr = c.get("r") or ""
                             var, size_hint = img_sst_idx[sst_idx]
-                            placements.append((fn, r_attr, var, size_hint))
+                            placements.append({
+                                "sheet_file": fn,
+                                "sheet_name": sheet_name,
+                                "sheet_index": sheet_index,
+                                "cell_ref": r_attr,
+                                "var": var,
+                                "size_hint": size_hint,
+                            })
                             c.attrib.pop("t", None)
                             c.remove(v_node)
                             continue
@@ -373,8 +552,14 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                             txt = t_inline.text
                             var, size_hint = parse_image_tag(txt or "")
                             if var:
-                                r_attr = c.get("r") or ""
-                                placements.append((fn, r_attr, var, size_hint))
+                                placements.append({
+                                    "sheet_file": fn,
+                                    "sheet_name": sheet_name,
+                                    "sheet_index": sheet_index,
+                                    "cell_ref": r_attr,
+                                    "var": var,
+                                    "size_hint": size_hint,
+                                })
                                 c.attrib.pop("t", None)
                                 try: c.remove(is_node)
                                 except: pass
@@ -419,7 +604,13 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
         import requests
 
         wb = load_workbook(dst_xlsx)
-        for sheet_file, cell_ref, var, size_hint in placements:
+        for item in placements:
+            sheet_file = item.get("sheet_file")
+            cell_ref = item.get("cell_ref")
+            var = item.get("var")
+            size_hint = item.get("size_hint")
+            sheet_index = item.get("sheet_index") or 0
+            sheet_name = item.get("sheet_name")
             meta = image_map.get(var)
             if not meta: continue
             url = meta["url"]
@@ -432,11 +623,17 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                 new_h = int(round(h * (px / w))) if w else h
                 img = img.resize((px, new_h), PILImage.LANCZOS)
             bio = io.BytesIO(); img.save(bio, format="PNG"); bio.seek(0)
-            # sheet_file は "sheetX.xml"。概ねワークブックの順序に対応
-            sheet_index = int(re.findall(r'\d+', sheet_file)[0]) - 1
-            ws = wb.worksheets[sheet_index] if 0 <= sheet_index < len(wb.worksheets) else wb.active
+            ws = None
+            if sheet_name and sheet_name in wb:
+                ws = wb[sheet_name]
+            elif isinstance(sheet_index, int) and 0 <= sheet_index < len(wb.worksheets):
+                ws = wb.worksheets[sheet_index]
+            if ws is None:
+                ws = wb.active
             ws.add_image(XLImage(bio), cell_ref)
         wb.save(dst_xlsx)
+
+    xlsx_update_formula_caches(dst_xlsx, formula_cells)
 
 # ------------ PDF / JPEG ------------
 def libreoffice_to_pdf(input_path: str, out_dir: str) -> str:
