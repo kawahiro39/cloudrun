@@ -393,6 +393,7 @@ def docx_convert_tags_to_jinja(in_docx: str, out_docx: str) -> Dict[str, Optiona
             root = tree.getroot()
             _word_convert_placeholders(root, size_hints)
             tree.write(p, encoding="utf-8", xml_declaration=True)
+
         with zipfile.ZipFile(out_docx, 'w', zipfile.ZIP_DEFLATED) as zout:
             for root, _, files in os.walk(tmpdir):
                 for fn in files:
@@ -559,6 +560,7 @@ def _word_postprocess_docx(docx_path: str, text_map: Dict[str, str], assets: Dic
                     zout.write(full, os.path.relpath(full, tmpdir))
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
 
 def docx_render(in_docx: str, out_docx: str, text_map: Dict[str, str], image_map: Dict[str, Dict]):
     from docxtpl import DocxTemplate, InlineImage
@@ -845,6 +847,7 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                                 "var": var,
                                 "size_hint": size_hint,
                             })
+
                             c.attrib.pop("t", None)
                             c.remove(v_node)
                             continue
@@ -869,6 +872,7 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                                     "var": var,
                                     "size_hint": size_hint,
                                 })
+
                                 c.attrib.pop("t", None)
                                 try: c.remove(is_node)
                                 except: pass
@@ -920,6 +924,7 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
             size_hint = item.get("size_hint")
             sheet_index = item.get("sheet_index") or 0
             sheet_name = item.get("sheet_name")
+
             meta = image_map.get(var)
             if not meta: continue
             url = meta["url"]
