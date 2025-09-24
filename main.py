@@ -9,6 +9,7 @@ import subprocess
 import xml.etree.ElementTree as ET
 from decimal import Decimal
 from lxml import etree as LET
+from jinja2 import Environment, DebugUndefined
 from typing import Dict, Tuple, List, Optional
 
 from fastapi import FastAPI, UploadFile, File, Form
@@ -43,6 +44,8 @@ VAR_NAME = r"[A-Za-z_][A-Za-z0-9_]*"
 IMG_KEY_PATTERN = re.compile(rf"^\{{\[(?P<var>{VAR_NAME})\](?::(?P<size>[^}}]+))?\}}$")
 TXT_KEY_PATTERN = re.compile(rf"^\{{(?P<var>{VAR_NAME})\}}$")
 IMG_TAG_PATTERN = re.compile(rf"\{{\[(?P<var>{VAR_NAME})\](?::(?P<size>[^}}]+))?\}}")
+IMG_TAG_INLINE = re.compile(rf"(?<!\{{)\{{\[\s*(?P<var>{VAR_NAME})\s*\](?::(?P<size>[^}}]+))?\}}(?!\}})")
+TXT_TAG_INLINE = re.compile(rf"(?<!\{{)\{{\s*(?P<var>{VAR_NAME})\s*\}}(?!\}})")
 MM_RE      = re.compile(r'^\s*(\d+(?:\.\d+)?)\s*mm\s*$', re.IGNORECASE)
 NUM_PLAIN  = re.compile(r'^\s*-?\d+(?:\.\d+)?\s*$')
 NUM_COMMA  = re.compile(r'^\s*-?\d{1,3}(?:,\d{3})+(?:\.\d+)?\s*$')
@@ -159,6 +162,12 @@ WORD_XML_TARGETS = ("word/document.xml","word/footnotes.xml","word/endnotes.xml"
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 S_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+WP_NS = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+PIC_NS = "http://schemas.openxmlformats.org/drawingml/2006/picture"
+XML_NS = "http://www.w3.org/XML/1998/namespace"
+EMU_PER_INCH = 914400
 
 def _word_collect_text_nodes(root) -> List[Tuple[LET._Element, int, int]]:
     nodes: List[Tuple[LET._Element, int, int]] = []
@@ -187,6 +196,58 @@ def _word_replace_range(root, start: int, end: int, replacement: str):
         else:
             node.text = before + after
 
+def _word_set_text(node: LET._Element, text: str):
+    run = node.getparent()
+    if run is None or run.tag != f"{{{W_NS}}}r":
+        node.text = text
+        return
+
+    children = list(run)
+    try:
+        idx = children.index(node)
+    except ValueError:
+        idx = -1
+
+    # remove text/break nodes after the current text node so we can rebuild
+    if idx >= 0:
+        for child in children[idx + 1:]:
+            if child.tag in {f"{{{W_NS}}}t", f"{{{W_NS}}}br"}:
+                run.remove(child)
+
+    parts = text.split("\n")
+    first = parts[0] if parts else ""
+    node.text = first
+    if first.strip() != first or "\n" in first or first == "":
+        node.set(f"{{{XML_NS}}}space", "preserve")
+    else:
+        node.attrib.pop(f"{{{XML_NS}}}space", None)
+
+    for part in parts[1:]:
+        br = LET.Element(f"{{{W_NS}}}br")
+        run.append(br)
+        t = LET.Element(f"{{{W_NS}}}t")
+        t.set(f"{{{XML_NS}}}space", "preserve")
+        t.text = part
+        run.append(t)
+
+def _word_replace_range_with_text(root, start: int, end: int, replacement: str):
+    nodes = _word_collect_text_nodes(root)
+    inserted = False
+    for node, node_start, node_end in nodes:
+        if node_end <= start or node_start >= end:
+            continue
+        text = node.text or ""
+        local_start = max(0, start - node_start)
+        local_end = min(len(text), end - node_start)
+        before = text[:local_start]
+        after = text[local_end:]
+        combined = before + replacement + after
+        if not inserted:
+            _word_set_text(node, combined)
+            inserted = True
+        else:
+            _word_set_text(node, before + after)
+
 def _word_convert_placeholders(root, size_hints: Dict[str, Optional[float]]):
     while True:
         nodes = _word_collect_text_nodes(root)
@@ -208,6 +269,108 @@ def _word_convert_placeholders(root, size_hints: Dict[str, Optional[float]]):
             continue
         break
 
+WORD_JINJA_PATTERN = re.compile(r"\{\{\s*(?P<var>%s)\s*\}\}" % VAR_NAME)
+
+def _word_apply_text_map(root, text_map: Dict[str, str]):
+    if not text_map:
+        return
+    for var, replacement in text_map.items():
+        pattern = re.compile(r"\{\{\s*%s\s*\}\}" % re.escape(var))
+        while True:
+            nodes = _word_collect_text_nodes(root)
+            if not nodes:
+                break
+            full_text = "".join((node.text or "") for node, _, _ in nodes)
+            m = pattern.search(full_text)
+            if not m:
+                break
+            _word_replace_range_with_text(root, m.start(), m.end(), replacement)
+
+def _word_part_rels_path(xml_path: str) -> str:
+    base = os.path.basename(xml_path)
+    rels_dir = os.path.join(os.path.dirname(xml_path), "_rels")
+    os.makedirs(rels_dir, exist_ok=True)
+    return os.path.join(rels_dir, base + ".rels")
+
+def _word_load_rels_tree(path: str) -> LET._ElementTree:
+    if os.path.exists(path):
+        return LET.parse(path)
+    root = LET.Element(f"{{{REL_NS}}}Relationships")
+    return LET.ElementTree(root)
+
+def _word_max_docpr_id(root) -> int:
+    max_id = 0
+    for el in root.iter(f"{{{WP_NS}}}docPr"):
+        try:
+            max_id = max(max_id, int(el.get("id", "0")))
+        except Exception:
+            continue
+    return max_id
+
+def _word_next_docpr(counter: List[int]) -> int:
+    counter[0] += 1
+    return counter[0]
+
+def _word_add_image_relationship(rels_root: LET._Element, target: str) -> Tuple[str, LET._Element]:
+    rid_max = 0
+    for rel in rels_root.findall(f"{{{REL_NS}}}Relationship"):
+        rid = rel.get("Id", "")
+        if rid.startswith("rId") and rid[3:].isdigit():
+            rid_max = max(rid_max, int(rid[3:]))
+    new_id = f"rId{rid_max + 1}"
+    rel = LET.SubElement(rels_root, f"{{{REL_NS}}}Relationship")
+    rel.set("Id", new_id)
+    rel.set("Type", f"{R_NS}/image")
+    rel.set("Target", target)
+    return new_id, rel
+
+def _word_make_inline_drawing(rid: str, docpr_id: int, cx: int, cy: int) -> LET._Element:
+    drawing = LET.Element(f"{{{W_NS}}}drawing")
+    inline = LET.SubElement(drawing, f"{{{WP_NS}}}inline")
+    for key in ("distT", "distB", "distL", "distR"):
+        inline.set(key, "0")
+    extent = LET.SubElement(inline, f"{{{WP_NS}}}extent")
+    extent.set("cx", str(max(cx, 1)))
+    extent.set("cy", str(max(cy, 1)))
+    effect = LET.SubElement(inline, f"{{{WP_NS}}}effectExtent")
+    for key in ("l", "t", "r", "b"):
+        effect.set(key, "0")
+    docpr = LET.SubElement(inline, f"{{{WP_NS}}}docPr")
+    docpr.set("id", str(docpr_id))
+    docpr.set("name", f"Picture {docpr_id}")
+    cNvGraphic = LET.SubElement(inline, f"{{{WP_NS}}}cNvGraphicFramePr")
+    locks = LET.SubElement(cNvGraphic, f"{{{A_NS}}}graphicFrameLocks")
+    locks.set("noChangeAspect", "1")
+    graphic = LET.SubElement(inline, f"{{{A_NS}}}graphic")
+    graphic_data = LET.SubElement(graphic, f"{{{A_NS}}}graphicData")
+    graphic_data.set("uri", PIC_NS)
+    pic = LET.SubElement(graphic_data, f"{{{PIC_NS}}}pic")
+    nv_pic = LET.SubElement(pic, f"{{{PIC_NS}}}nvPicPr")
+    cNvPr = LET.SubElement(nv_pic, f"{{{PIC_NS}}}cNvPr")
+    cNvPr.set("id", "0")
+    cNvPr.set("name", f"Picture {docpr_id}")
+    cNvPicPr = LET.SubElement(nv_pic, f"{{{PIC_NS}}}cNvPicPr")
+    pic_locks = LET.SubElement(cNvPicPr, f"{{{A_NS}}}picLocks")
+    pic_locks.set("noChangeAspect", "1")
+    pic_locks.set("noChangeArrowheads", "1")
+    blip_fill = LET.SubElement(pic, f"{{{PIC_NS}}}blipFill")
+    blip = LET.SubElement(blip_fill, f"{{{A_NS}}}blip")
+    blip.set(f"{{{R_NS}}}embed", rid)
+    stretch = LET.SubElement(blip_fill, f"{{{A_NS}}}stretch")
+    LET.SubElement(stretch, f"{{{A_NS}}}fillRect")
+    sp_pr = LET.SubElement(pic, f"{{{PIC_NS}}}spPr")
+    xfrm = LET.SubElement(sp_pr, f"{{{A_NS}}}xfrm")
+    off = LET.SubElement(xfrm, f"{{{A_NS}}}off")
+    off.set("x", "0")
+    off.set("y", "0")
+    ext = LET.SubElement(xfrm, f"{{{A_NS}}}ext")
+    ext.set("cx", str(max(cx, 1)))
+    ext.set("cy", str(max(cy, 1)))
+    prst = LET.SubElement(sp_pr, f"{{{A_NS}}}prstGeom")
+    prst.set("prst", "rect")
+    LET.SubElement(prst, f"{{{A_NS}}}avLst")
+    return drawing
+
 def _word_content_xmls(extracted_dir: str) -> List[str]:
     targets = list(WORD_XML_TARGETS)
     wdir = os.path.join(extracted_dir, "word")
@@ -225,6 +388,12 @@ def docx_convert_tags_to_jinja(in_docx: str, out_docx: str) -> Dict[str, Optiona
         with zipfile.ZipFile(in_docx, 'r') as zin:
             zin.extractall(tmpdir)
         for p in _word_content_xmls(tmpdir):
+            parser = LET.XMLParser(remove_blank_text=False)
+            tree = LET.parse(p, parser)
+            root = tree.getroot()
+            _word_convert_placeholders(root, size_hints)
+            tree.write(p, encoding="utf-8", xml_declaration=True)
+
         with zipfile.ZipFile(out_docx, 'w', zipfile.ZIP_DEFLATED) as zout:
             for root, _, files in os.walk(tmpdir):
                 for fn in files:
@@ -233,6 +402,165 @@ def docx_convert_tags_to_jinja(in_docx: str, out_docx: str) -> Dict[str, Optiona
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
     return size_hints
+
+def _word_replace_placeholder_with_drawing(root, start: int, end: int, drawing: LET._Element) -> bool:
+    nodes = _word_collect_text_nodes(root)
+    if not nodes:
+        return False
+    affected_runs: List[LET._Element] = []
+    for node, node_start, node_end in nodes:
+        if node_end <= start or node_start >= end:
+            continue
+        run = node.getparent()
+        if run is None or run.tag != f"{{{W_NS}}}r":
+            continue
+        if run not in affected_runs:
+            affected_runs.append(run)
+        text = node.text or ""
+        local_start = max(0, start - node_start)
+        local_end = min(len(text), end - node_start)
+        new_text = text[:local_start] + text[local_end:]
+        if new_text:
+            _word_set_text(node, new_text)
+        else:
+            run.remove(node)
+    if not affected_runs:
+        return False
+    last_run = affected_runs[-1]
+    parent = last_run.getparent()
+    if parent is None:
+        return False
+    insert_idx = parent.index(last_run) + 1
+    new_run = LET.Element(f"{{{W_NS}}}r")
+    rpr = affected_runs[0].find(f"{{{W_NS}}}rPr")
+    if rpr is not None:
+        new_run.append(LET.fromstring(LET.tostring(rpr)))
+    new_run.append(drawing)
+    parent.insert(insert_idx, new_run)
+    for run in affected_runs:
+        removable = True
+        for child in run:
+            if child.tag not in {f"{{{W_NS}}}rPr"}:
+                removable = False
+                break
+        if removable and (run.text is None or not run.text.strip()):
+            run_parent = run.getparent()
+            if run_parent is not None:
+                run_parent.remove(run)
+    return True
+
+def _word_prepare_image_assets(image_blobs: Dict[str, Dict[str, Optional[float]]]) -> Dict[str, Dict[str, object]]:
+    if not image_blobs:
+        return {}
+    from PIL import Image as PILImage
+
+    assets: Dict[str, Dict[str, object]] = {}
+    for idx, (var, info) in enumerate(image_blobs.items(), start=1):
+        data = info.get("bytes") if isinstance(info, dict) else None
+        if not data:
+            continue
+        mm = None
+        if isinstance(info, dict):
+            mm = info.get("mm")
+        try:
+            img = PILImage.open(io.BytesIO(data)).convert("RGBA")
+        except Exception:
+            continue
+        if mm:
+            px = mm_to_pixels(mm, dpi=96)
+            if px > 0:
+                w, h = img.size
+                if w:
+                    new_h = int(round(h * (px / w))) if w else h
+                    new_h = max(new_h, 1)
+                    img = img.resize((max(px, 1), new_h), PILImage.LANCZOS)
+        width_px, height_px = img.size
+        if width_px <= 0 or height_px <= 0:
+            continue
+        bio = io.BytesIO()
+        img.save(bio, format="PNG")
+        safe = re.sub(r"[^A-Za-z0-9]+", "_", var).strip("_") or "image"
+        filename = f"auto_{idx:04d}_{safe}.png"
+        cx = int(round(max(width_px, 1) / 96 * EMU_PER_INCH))
+        cy = int(round(max(height_px, 1) / 96 * EMU_PER_INCH))
+        assets[var] = {
+            "bytes": bio.getvalue(),
+            "filename": filename,
+            "target": f"media/{filename}",
+            "cx": max(cx, 1),
+            "cy": max(cy, 1),
+        }
+    return assets
+
+def _word_apply_images(root, rels_tree: LET._ElementTree, assets: Dict[str, Dict[str, object]]) -> Tuple[bool, List[str]]:
+    if not assets:
+        return False, []
+    rels_root = rels_tree.getroot()
+    docpr_counter = [_word_max_docpr_id(root)]
+    changed = False
+    used: List[str] = []
+    for var, asset in assets.items():
+        pattern = re.compile(r"\{\{\s*%s\s*\}\}" % re.escape(var))
+        while True:
+            nodes = _word_collect_text_nodes(root)
+            if not nodes:
+                break
+            full_text = "".join((node.text or "") for node, _, _ in nodes)
+            m = pattern.search(full_text)
+            if not m:
+                break
+            rid, rel_elem = _word_add_image_relationship(rels_root, asset["target"])
+            docpr_id = _word_next_docpr(docpr_counter)
+            drawing = _word_make_inline_drawing(rid, docpr_id, int(asset.get("cx", 1)), int(asset.get("cy", 1)))
+            if _word_replace_placeholder_with_drawing(root, m.start(), m.end(), drawing):
+                changed = True
+                used.append(var)
+            else:
+                rels_root.remove(rel_elem)
+                docpr_counter[0] -= 1
+                break
+    return changed, used
+
+def _word_postprocess_docx(docx_path: str, text_map: Dict[str, str], assets: Dict[str, Dict[str, object]]):
+    tmpdir = tempfile.mkdtemp()
+    try:
+        with zipfile.ZipFile(docx_path, 'r') as zin:
+            zin.extractall(tmpdir)
+
+        used_vars: List[str] = []
+        for p in _word_content_xmls(tmpdir):
+            parser = LET.XMLParser(remove_blank_text=False)
+            tree = LET.parse(p, parser)
+            root = tree.getroot()
+            _word_apply_text_map(root, text_map)
+            if assets:
+                rels_path = _word_part_rels_path(p)
+                rels_tree = _word_load_rels_tree(rels_path)
+                changed, used = _word_apply_images(root, rels_tree, assets)
+                if changed:
+                    rels_tree.write(rels_path, encoding="utf-8", xml_declaration=True)
+                if used:
+                    used_vars.extend(used)
+            tree.write(p, encoding="utf-8", xml_declaration=True)
+
+        if assets and used_vars:
+            media_dir = os.path.join(tmpdir, "word", "media")
+            os.makedirs(media_dir, exist_ok=True)
+            for var in set(used_vars):
+                asset = assets.get(var)
+                if not asset:
+                    continue
+                with open(os.path.join(media_dir, asset["filename"]), "wb") as f:
+                    f.write(asset["bytes"])
+
+        with zipfile.ZipFile(docx_path, 'w', zipfile.ZIP_DEFLATED) as zout:
+            for root_dir, _, files in os.walk(tmpdir):
+                for fn in files:
+                    full = os.path.join(root_dir, fn)
+                    zout.write(full, os.path.relpath(full, tmpdir))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
 
 def docx_render(in_docx: str, out_docx: str, text_map: Dict[str, str], image_map: Dict[str, Dict]):
     from docxtpl import DocxTemplate, InlineImage
@@ -246,32 +574,21 @@ def docx_render(in_docx: str, out_docx: str, text_map: Dict[str, str], image_map
     ctx: Dict[str, object] = {}
     for k, v in text_map.items():
         ctx[k] = v
+    image_blobs: Dict[str, Dict[str, Optional[float]]] = {}
     for k, meta in image_map.items():
         r = requests.get(meta["url"], timeout=20); r.raise_for_status()
-        bio = io.BytesIO(r.content)
+        content = r.content
+        bio = io.BytesIO(content)
         mm = meta.get("mm") or size_hints.get(k)
+        image_blobs[k] = {"bytes": content, "mm": mm}
         ctx[k] = InlineImage(doc, bio, width=Mm(mm)) if mm else InlineImage(doc, bio)
+    jinja_env = Environment(autoescape=False, undefined=DebugUndefined)
+    doc.render(ctx, jinja_env=jinja_env)
     doc.save(out_docx)
     os.remove(tmp)
 
-    # 図形内テキストなどに残った {{var}} を後置換
-    tmpdir = tempfile.mkdtemp()
-    try:
-        with zipfile.ZipFile(out_docx, 'r') as zin:
-            zin.extractall(tmpdir)
-        for p in _word_content_xmls(tmpdir):
-            parser = LET.XMLParser(remove_blank_text=False)
-            tree = LET.parse(p, parser)
-            root = tree.getroot()
-            _word_apply_text_map(root, text_map)
-            tree.write(p, encoding="utf-8", xml_declaration=True)
-        with zipfile.ZipFile(out_docx, 'w', zipfile.ZIP_DEFLATED) as zout:
-            for root, _, files in os.walk(tmpdir):
-                for fn in files:
-                    full = os.path.join(root, fn)
-                    zout.write(full, os.path.relpath(full, tmpdir))
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+    assets = _word_prepare_image_assets(image_blobs)
+    _word_postprocess_docx(out_docx, text_map, assets)
 
 # ------------ Excel (.xlsx) ------------
 def _xlsx_sheet_map(extracted_dir: str) -> Dict[str, Tuple[Optional[str], Optional[int]]]:
@@ -433,6 +750,8 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
     """
     ns = {"s": S_NS}
     tmpdir = tempfile.mkdtemp()
+    placements: List[Dict[str, object]] = []
+    formula_cells: List[Dict[str, object]] = []
     try:
         with zipfile.ZipFile(src_xlsx, 'r') as zin:
             zin.extractall(tmpdir)
@@ -496,6 +815,16 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                     v_node = c.find("s:v", ns)
                     is_node = c.find("s:is", ns)
                     f_node = c.find("s:f", ns)
+                    r_attr = c.get("r") or ""
+
+                    if f_node is not None:
+                        formula_cells.append({
+                            "sheet_file": fn,
+                            "sheet_name": sheet_name,
+                            "sheet_index": sheet_index,
+                            "cell_ref": r_attr,
+                            "boolean": (c.get("t") == "b"),
+                        })
 
                     # 数式セルはキャッシュ値を削除し LibreOffice での再計算を確実化
                     if f_node is not None and v_node is not None:
@@ -509,6 +838,16 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                         except: sst_idx = None
                         if sst_idx is not None and sst_idx in img_sst_idx:
                             # 画像座標として記録してセルは空に
+                            var, size_hint = img_sst_idx[sst_idx]
+                            placements.append({
+                                "sheet_file": fn,
+                                "sheet_name": sheet_name,
+                                "sheet_index": sheet_index,
+                                "cell_ref": r_attr,
+                                "var": var,
+                                "size_hint": size_hint,
+                            })
+
                             c.attrib.pop("t", None)
                             c.remove(v_node)
                             continue
@@ -525,6 +864,15 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                             txt = t_inline.text
                             var, size_hint = parse_image_tag(txt or "")
                             if var:
+                                placements.append({
+                                    "sheet_file": fn,
+                                    "sheet_name": sheet_name,
+                                    "sheet_index": sheet_index,
+                                    "cell_ref": r_attr,
+                                    "var": var,
+                                    "size_hint": size_hint,
+                                })
+
                                 c.attrib.pop("t", None)
                                 try: c.remove(is_node)
                                 except: pass
@@ -569,6 +917,14 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
         import requests
 
         wb = load_workbook(dst_xlsx)
+        for item in placements:
+            sheet_file = item.get("sheet_file")
+            cell_ref = item.get("cell_ref")
+            var = item.get("var")
+            size_hint = item.get("size_hint")
+            sheet_index = item.get("sheet_index") or 0
+            sheet_name = item.get("sheet_name")
+
             meta = image_map.get(var)
             if not meta: continue
             url = meta["url"]
