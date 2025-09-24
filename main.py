@@ -244,13 +244,13 @@ def docx_render(in_docx: str, out_docx: str, text_map: Dict[str, str], image_map
 
     doc = DocxTemplate(tmp)
     ctx: Dict[str, object] = {}
-    for k, v in text_map.items(): ctx[k] = v
+    for k, v in text_map.items():
+        ctx[k] = v
     for k, meta in image_map.items():
         r = requests.get(meta["url"], timeout=20); r.raise_for_status()
         bio = io.BytesIO(r.content)
         mm = meta.get("mm") or size_hints.get(k)
         ctx[k] = InlineImage(doc, bio, width=Mm(mm)) if mm else InlineImage(doc, bio)
-    doc.render(ctx)
     doc.save(out_docx)
     os.remove(tmp)
 
@@ -260,10 +260,11 @@ def docx_render(in_docx: str, out_docx: str, text_map: Dict[str, str], image_map
         with zipfile.ZipFile(out_docx, 'r') as zin:
             zin.extractall(tmpdir)
         for p in _word_content_xmls(tmpdir):
-            s = open(p, "r", encoding="utf-8").read()
-            for k, v in text_map.items():
-                s = s.replace(f"{{{{ {k} }}}}", v).replace(f"{{{{{k}}}}}", v)
-            open(p, "w", encoding="utf-8").write(s)
+            parser = LET.XMLParser(remove_blank_text=False)
+            tree = LET.parse(p, parser)
+            root = tree.getroot()
+            _word_apply_text_map(root, text_map)
+            tree.write(p, encoding="utf-8", xml_declaration=True)
         with zipfile.ZipFile(out_docx, 'w', zipfile.ZIP_DEFLATED) as zout:
             for root, _, files in os.walk(tmpdir):
                 for fn in files:
