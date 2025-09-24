@@ -7,6 +7,7 @@ import zipfile
 import shutil
 import subprocess
 import xml.etree.ElementTree as ET
+from lxml import etree as LET
 from typing import Dict, Tuple, List, Optional
 
 from fastapi import FastAPI, UploadFile, File, Form
@@ -140,8 +141,8 @@ def parse_pages_arg(pages: str, total_pages: int) -> List[int]:
 WORD_XML_TARGETS = ("word/document.xml","word/footnotes.xml","word/endnotes.xml","word/comments.xml")
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
-def _word_collect_text_nodes(root) -> List[Tuple[ET.Element, int, int]]:
-    nodes: List[Tuple[ET.Element, int, int]] = []
+def _word_collect_text_nodes(root) -> List[Tuple[LET._Element, int, int]]:
+    nodes: List[Tuple[LET._Element, int, int]] = []
     cursor = 0
     for t in root.iter(f"{{{W_NS}}}t"):
         text = t.text or ""
@@ -205,7 +206,8 @@ def docx_convert_tags_to_jinja(in_docx: str, out_docx: str) -> Dict[str, Optiona
         with zipfile.ZipFile(in_docx, 'r') as zin:
             zin.extractall(tmpdir)
         for p in _word_content_xmls(tmpdir):
-            tree = ET.parse(p)
+            parser = LET.XMLParser(remove_blank_text=False)
+            tree = LET.parse(p, parser)
             root = tree.getroot()
             _word_convert_placeholders(root, size_hints)
             tree.write(p, encoding="utf-8", xml_declaration=True)
