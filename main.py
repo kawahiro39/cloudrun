@@ -17,6 +17,8 @@ import requests
 from fastapi import FastAPI, UploadFile, File, Form, Header
 from fastapi.responses import JSONResponse
 
+DEFAULT_AUTH_API_BASE_URL = "https://auth-677366504119.asia-northeast1.run.app"
+
 app = FastAPI(title="Doc/Excel → PDF & JPEG API (stable)")
 
 # ------------ light helpers ------------
@@ -50,7 +52,7 @@ def _auth_api_timeout() -> float:
 
 
 def validate_auth_id(auth_id: str) -> bool:
-    base_url = (os.environ.get("AUTH_API_BASE_URL") or "").rstrip("/")
+    base_url = (os.environ.get("AUTH_API_BASE_URL") or DEFAULT_AUTH_API_BASE_URL or "").rstrip("/")
     if not base_url:
         raise RuntimeError("AUTH_API_BASE_URL is not configured")
     if not auth_id:
