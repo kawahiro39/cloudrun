@@ -12,7 +12,9 @@ from lxml import etree as LET
 from jinja2 import Environment, DebugUndefined
 from typing import Dict, Tuple, List, Optional
 
-from fastapi import FastAPI, UploadFile, File, Form
+import requests
+
+from fastapi import FastAPI, UploadFile, File, Form, Header
 from fastapi.responses import JSONResponse
 
 app = FastAPI(title="Doc/Excel → PDF & JPEG API (stable)")
@@ -38,6 +40,40 @@ def run(cmd: List[str], cwd: Optional[str] = None):
 
 def ok(d): return JSONResponse(status_code=200, content=d)
 def err(m, status=400): return JSONResponse(status_code=status, content={"error": str(m)})
+
+
+def _auth_api_timeout() -> float:
+    try:
+        return float(os.environ.get("AUTH_API_TIMEOUT", "5"))
+    except ValueError:
+        return 5.0
+
+
+def validate_auth_id(auth_id: str) -> bool:
+    base_url = (os.environ.get("AUTH_API_BASE_URL") or "").rstrip("/")
+    if not base_url:
+        raise RuntimeError("AUTH_API_BASE_URL is not configured")
+    if not auth_id:
+        return False
+
+    url = f"{base_url}/auth-ids/verify"
+    payload = {"auth_id": auth_id}
+    try:
+        resp = requests.post(url, json=payload, timeout=_auth_api_timeout())
+    except requests.RequestException as exc:
+        raise RuntimeError(f"auth_id validation request failed: {exc}")
+
+    if resp.status_code in {401, 404}:
+        return False
+    if resp.status_code >= 400:
+        raise RuntimeError(f"auth_id validation failed with status {resp.status_code}")
+
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        raise RuntimeError("auth_id validation returned invalid JSON") from exc
+
+    return bool(data.get("is_valid"))
 
 # ------------ tag & number parsing ------------
 VAR_NAME = r"[A-Za-z_][A-Za-z0-9_]*"
@@ -562,7 +598,6 @@ def _word_postprocess_docx(docx_path: str, text_map: Dict[str, str], assets: Dic
 def docx_render(in_docx: str, out_docx: str, text_map: Dict[str, str], image_map: Dict[str, Dict]):
     from docxtpl import DocxTemplate, InlineImage
     from docx.shared import Mm
-    import requests
 
     tmp = in_docx + ".jinja.docx"
     size_hints = docx_convert_tags_to_jinja(in_docx, tmp)
@@ -911,7 +946,6 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
         from openpyxl import load_workbook
         from openpyxl.drawing.image import Image as XLImage
         from PIL import Image as PILImage
-        import requests
 
         wb = load_workbook(dst_xlsx)
         for item in placements:
@@ -993,10 +1027,24 @@ async def merge(
     filename: str = Form("document"),
     jpeg_dpi: int = Form(150),
     jpeg_pages: str = Form("1"),
+    x_auth_id: Optional[str] = Header(None, alias="X-Auth-Id"),
+    authorization: Optional[str] = Header(None),
 ):
     from pypdf import PdfReader  # lazy import
 
     try:
+        auth_id = x_auth_id or ""
+        if not auth_id and authorization:
+            auth_id = authorization.strip()
+            if auth_id.lower().startswith("bearer "):
+                auth_id = auth_id[7:].strip()
+
+        if not auth_id:
+            return err("missing auth_id", status=401)
+
+        if not validate_auth_id(auth_id):
+            return err("invalid auth_id", status=401)
+
         ext = file_ext_lower(file.filename or "")
         if ext not in [".docx", ".xlsx"]:
             return err("file must be .docx or .xlsx", 400)
