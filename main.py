@@ -262,16 +262,59 @@ ET.register_namespace("s", S_NS)
 CELL_REF_RE = re.compile(r"^([A-Za-z]+)(\d+)$")
 
 
-def _xml_write_tree(tree: ET.ElementTree, path: str, default_namespace: Optional[str] = None):
-    kwargs = {"encoding": "utf-8", "xml_declaration": True}
-    if default_namespace:
-        try:
-            root = tree.getroot()
-        except Exception:
-            root = None
+def _xml_collect_namespaces(path: str) -> Dict[str, str]:
+    namespaces: Dict[str, str] = {}
+    if not os.path.exists(path):
+        return namespaces
+    try:
+        for _, (prefix, uri) in ET.iterparse(path, events=("start-ns",)):
+            if uri == XMLNS_NS:
+                continue
+            if prefix in namespaces:
+                continue
+            namespaces[prefix or ""] = uri
+    except Exception:
+        return namespaces
+    return namespaces
 
+
+def _xml_parse_tree(path: str) -> Tuple[ET.ElementTree, Dict[str, str]]:
+    namespaces = _xml_collect_namespaces(path)
+    tree = ET.parse(path)
+    return tree, namespaces
+
+
+def _xml_write_tree(
+    tree: ET.ElementTree,
+    path: str,
+    default_namespace: Optional[str] = None,
+    namespace_map: Optional[Dict[str, str]] = None,
+):
+    kwargs = {"encoding": "utf-8", "xml_declaration": True}
+    root: Optional[ET.Element] = None
+    try:
+        root = tree.getroot()
+    except Exception:
+        root = None
+
+    if namespace_map and root is not None:
+        for prefix, uri in namespace_map.items():
+            if prefix in {"xml", "xmlns"}:
+                continue
+            if prefix:
+                attr = f"{{{XMLNS_NS}}}{prefix}"
+                if root.get(attr) != uri:
+                    root.set(attr, uri)
+                try:
+                    ET.register_namespace(prefix, uri)
+                except ValueError:
+                    pass
+        if not default_namespace and "" in namespace_map:
+            default_namespace = namespace_map.get("")
+
+    if default_namespace:
+        missing: List[ET.Element] = []
         if root is not None:
-            missing: List[ET.Element] = []
             for node in root.iter():
                 tag = getattr(node, "tag", None)
                 if not isinstance(tag, str):
@@ -279,19 +322,80 @@ def _xml_write_tree(tree: ET.ElementTree, path: str, default_namespace: Optional
                 if not tag.startswith("{"):
                     missing.append(node)
 
-            if missing:
-                for node in missing:
-                    node.tag = f"{{{default_namespace}}}{node.tag}"
-                kwargs["default_namespace"] = default_namespace
-            else:
-                kwargs["default_namespace"] = default_namespace
+        if missing:
+            for node in missing:
+                node.tag = f"{{{default_namespace}}}{node.tag}"
+            kwargs["default_namespace"] = default_namespace
+    buffer = io.BytesIO()
     try:
-        tree.write(path, **kwargs)
+        tree.write(buffer, **kwargs)
     except ValueError as exc:
         if "non-qualified names" in str(exc) and kwargs.pop("default_namespace", None):
-            tree.write(path, **kwargs)
+            buffer = io.BytesIO()
+            tree.write(buffer, **kwargs)
         else:
             raise
+
+    xml_text = buffer.getvalue().decode("utf-8")
+
+    if namespace_map and root is not None:
+        insertions: List[str] = []
+        root_start = xml_text.find("<")
+        while root_start != -1 and root_start + 1 < len(xml_text) and xml_text[root_start + 1] in {"?", "!"}:
+            root_start = xml_text.find("<", root_start + 1)
+        root_end = xml_text.find(">", root_start if root_start != -1 else 0)
+        if root_start != -1 and root_end != -1:
+            root_tag = xml_text[root_start:root_end]
+            alias_pattern = re.compile(rf"\sxmlns:(ns\d+)=\"{re.escape(XMLNS_NS)}\"")
+            aliases = set(alias_pattern.findall(root_tag))
+            for alias in aliases:
+                root_tag = re.sub(rf"\sxmlns:{alias}=\"{re.escape(XMLNS_NS)}\"", "", root_tag)
+                root_tag = re.sub(rf"(\s){alias}:", r"\1xmlns:", root_tag)
+            if aliases:
+                xml_text = xml_text[:root_start] + root_tag + xml_text[root_end:]
+                root_end = xml_text.find(">", root_start)
+                root_tag = xml_text[root_start:root_end]
+
+            decl_pattern = re.compile(r"\sxmlns(?::([A-Za-z0-9_.\-]+))?=\"([^\"]+)\"")
+            seen_decl: Set[Tuple[str, str]] = set()
+
+            def _dedup_decl(match: re.Match[str]) -> str:
+                prefix = match.group(1) or ""
+                uri = match.group(2)
+                key = (prefix, uri)
+                if key in seen_decl:
+                    return ""
+                seen_decl.add(key)
+                return match.group(0)
+
+            root_tag = decl_pattern.sub(_dedup_decl, root_tag)
+            if seen_decl:
+                xml_text = xml_text[:root_start] + root_tag + xml_text[root_end:]
+                root_end = xml_text.find(">", root_start)
+                root_tag = xml_text[root_start:root_end]
+
+            existing_decls: Dict[str, str] = {}
+            for match in re.findall(r"xmlns(?::([A-Za-z0-9_.\-]+))?=\"([^\"]+)\"", root_tag):
+                prefix, uri = match
+                existing_decls[prefix or ""] = uri
+
+            default_uri = namespace_map.get("")
+            if default_uri and existing_decls.get("", "") != default_uri:
+                insertions.append(f' xmlns="{default_uri}"')
+            for prefix, uri in namespace_map.items():
+                if prefix in {"", "xml", "xmlns"}:
+                    continue
+                if existing_decls.get(prefix) == uri:
+                    continue
+                insertions.append(f" xmlns:{prefix}=\"{uri}\"")
+            if insertions:
+                insert_pos = root_end
+                if xml_text[insert_pos - 1] == "/":
+                    insert_pos -= 1
+                xml_text = xml_text[:insert_pos] + "".join(insertions) + xml_text[insert_pos:]
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(xml_text)
 
 def _word_set_text(node: LET._Element, text: str):
     run = node.getparent()
@@ -885,7 +989,7 @@ def _xlsx_update_content_types(extracted_dir: str, media_exts: Set[str], drawing
         return
 
     try:
-        tree = ET.parse(path)
+        tree, nsmap = _xml_parse_tree(path)
     except Exception:
         return
 
@@ -933,7 +1037,7 @@ def _xlsx_update_content_types(extracted_dir: str, media_exts: Set[str], drawing
         changed = True
 
     if changed:
-        _xml_write_tree(tree, path, default_namespace=CONTENT_TYPES_NS)
+        _xml_write_tree(tree, path, default_namespace=CONTENT_TYPES_NS, namespace_map=nsmap)
 
 
 def _xlsx_ensure_dir(path: str):
@@ -976,7 +1080,8 @@ def xlsx_force_full_recalc(extracted_dir: str):
     p = os.path.join(extracted_dir, "xl", "workbook.xml")
     if not os.path.exists(p): return
     ns = {"s": S_NS}
-    tree = ET.parse(p); root = tree.getroot()
+    tree, workbook_nsmap = _xml_parse_tree(p)
+    root = tree.getroot()
     calcPr = root.find("s:calcPr", ns)
     if calcPr is None:
         calcPr = ET.SubElement(root, f"{{{ns['s']}}}calcPr")
@@ -994,7 +1099,7 @@ def xlsx_force_full_recalc(extracted_dir: str):
         except: pass
     rels_path = os.path.join(extracted_dir, "xl", "_rels", "workbook.xml.rels")
     if os.path.exists(rels_path):
-        rels_tree = ET.parse(rels_path)
+        rels_tree, rels_nsmap = _xml_parse_tree(rels_path)
         rels_root = rels_tree.getroot()
         removed = False
         for rel in list(rels_root.findall(f".//{{{REL_NS}}}Relationship")):
@@ -1004,10 +1109,16 @@ def xlsx_force_full_recalc(extracted_dir: str):
                 rels_root.remove(rel)
                 removed = True
         if removed:
-            _xml_write_tree(rels_tree, rels_path, default_namespace=REL_NS)
+            default_rels_ns = rels_nsmap.get("") if rels_nsmap else REL_NS
+            _xml_write_tree(
+                rels_tree,
+                rels_path,
+                default_namespace=default_rels_ns,
+                namespace_map=rels_nsmap,
+            )
     ct_path = os.path.join(extracted_dir, "[Content_Types].xml")
     if os.path.exists(ct_path):
-        ct_tree = ET.parse(ct_path)
+        ct_tree, ct_nsmap = _xml_parse_tree(ct_path)
         ct_root = ct_tree.getroot()
         ns_ct = {"ct": CONTENT_TYPES_NS}
         removed = False
@@ -1017,8 +1128,13 @@ def xlsx_force_full_recalc(extracted_dir: str):
                 ct_root.remove(node)
                 removed = True
         if removed:
-            _xml_write_tree(ct_tree, ct_path, default_namespace=CONTENT_TYPES_NS)
-    tree.write(p, encoding="utf-8", xml_declaration=True)
+            _xml_write_tree(
+                ct_tree,
+                ct_path,
+                default_namespace=CONTENT_TYPES_NS,
+                namespace_map=ct_nsmap,
+            )
+    _xml_write_tree(tree, p, default_namespace=workbook_nsmap.get("") if workbook_nsmap else S_NS, namespace_map=workbook_nsmap)
 
 def _xlsx_escape_sheet_name(name: str) -> str:
     if not name:
@@ -1097,7 +1213,7 @@ def xlsx_update_formula_caches(xlsx_path: str, formula_cells: List[Dict]):
         with zipfile.ZipFile(xlsx_path, 'r') as zin:
             zin.extractall(tmpdir)
         ns = {"s": S_NS}
-        updated: Dict[str, ET.ElementTree] = {}
+        updated: Dict[str, Tuple[ET.ElementTree, Dict[str, str]]] = {}
         for info in formula_cells:
             sheet_file = info.get("sheet_file")
             cell_ref = info.get("cell_ref")
@@ -1108,8 +1224,9 @@ def xlsx_update_formula_caches(xlsx_path: str, formula_cells: List[Dict]):
             if not os.path.exists(sheet_path):
                 continue
             if sheet_file not in updated:
-                updated[sheet_file] = ET.parse(sheet_path)
-            tree = updated[sheet_file]
+                tree, nsmap = _xml_parse_tree(sheet_path)
+                updated[sheet_file] = (tree, nsmap)
+            tree, nsmap = updated[sheet_file]
             root = tree.getroot()
             cell = root.find(f".//s:c[@r='{cell_ref}']", ns)
             if cell is None:
@@ -1139,9 +1256,9 @@ def xlsx_update_formula_caches(xlsx_path: str, formula_cells: List[Dict]):
                         cell.set("t", original_type)
                     else:
                         cell.attrib.pop("t", None)
-        for sheet_file, tree in updated.items():
+        for sheet_file, (tree, nsmap) in updated.items():
             sheet_path = os.path.join(tmpdir, "xl", "worksheets", sheet_file)
-            tree.write(sheet_path, encoding="utf-8", xml_declaration=True)
+            _xml_write_tree(tree, sheet_path, namespace_map=nsmap)
         with zipfile.ZipFile(xlsx_path, 'w', zipfile.ZIP_DEFLATED) as zout:
             for root_dir, _, files in os.walk(tmpdir):
                 for fn in files:
@@ -1171,7 +1288,8 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
         img_sst_idx: Dict[int, Tuple[str, Optional[float]]] = {}
 
         if os.path.exists(sst_path):
-            tree = ET.parse(sst_path); root = tree.getroot(); idx = -1
+            tree, sst_nsmap = _xml_parse_tree(sst_path)
+            root = tree.getroot(); idx = -1
             for si in root.findall("s:si", ns):
                 idx += 1
                 t_nodes = si.findall("s:t", ns)
@@ -1204,7 +1322,7 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                         num, _ = parse_numberlike(mapped)
                         numeric_candidates[idx] = ((num is not None), num)
 
-            tree.write(sst_path, encoding="utf-8", xml_declaration=True)
+            _xml_write_tree(tree, sst_path, namespace_map=sst_nsmap)
 
         # worksheets
         ws_dir = os.path.join(tmpdir, "xl", "worksheets")
@@ -1213,7 +1331,8 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
             for fn in os.listdir(ws_dir):
                 if not fn.endswith(".xml"): continue
                 p = os.path.join(ws_dir, fn)
-                tree = ET.parse(p); root = tree.getroot()
+                tree, sheet_nsmap = _xml_parse_tree(p)
+                root = tree.getroot()
 
                 sheet_name, sheet_index = sheet_map.get(fn, (None, None))
                 if sheet_index is None:
@@ -1323,7 +1442,7 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                             replaced = _apply_text_tokens(txt, text_map)
                             t_inline.text = replaced
 
-                tree.write(p, encoding="utf-8", xml_declaration=True)
+                _xml_write_tree(tree, p, namespace_map=sheet_nsmap)
 
         drawings_dir = os.path.join(tmpdir, "xl", "drawings")
         if image_map:
@@ -1345,36 +1464,37 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
             existing_media = set(os.listdir(media_dir)) if os.path.isdir(media_dir) else set()
             existing_drawings = set(os.listdir(drawings_dir)) if os.path.isdir(drawings_dir) else set()
 
-            sheet_tree_cache: Dict[str, ET.ElementTree] = {}
-            sheet_rels_cache: Dict[str, ET.ElementTree] = {}
+            sheet_tree_cache: Dict[str, Tuple[ET.ElementTree, Dict[str, str]]] = {}
+            sheet_rels_cache: Dict[str, Tuple[ET.ElementTree, Dict[str, str]]] = {}
             drawing_cache: Dict[str, Dict[str, object]] = {}
             used_media_exts: Set[str] = set()
             new_drawing_files: Set[str] = set()
 
             def _ensure_sheet_tree(sheet_file: str) -> Optional[ET.ElementTree]:
-                tree = sheet_tree_cache.get(sheet_file)
-                if tree is not None:
-                    return tree
+                cached = sheet_tree_cache.get(sheet_file)
+                if cached is not None:
+                    return cached[0]
                 path = os.path.join(tmpdir, "xl", "worksheets", sheet_file)
                 if not os.path.exists(path):
                     return None
-                tree = ET.parse(path)
-                sheet_tree_cache[sheet_file] = tree
+                tree, nsmap = _xml_parse_tree(path)
+                sheet_tree_cache[sheet_file] = (tree, nsmap)
                 return tree
 
             def _ensure_sheet_rels(sheet_file: str) -> ET.ElementTree:
-                tree = sheet_rels_cache.get(sheet_file)
-                if tree is not None:
-                    return tree
+                cached = sheet_rels_cache.get(sheet_file)
+                if cached is not None:
+                    return cached[0]
                 rels_dir = os.path.join(tmpdir, "xl", "worksheets", "_rels")
                 _xlsx_ensure_dir(rels_dir)
                 path = os.path.join(rels_dir, f"{sheet_file}.rels")
                 if os.path.exists(path):
-                    tree = ET.parse(path)
+                    tree, nsmap = _xml_parse_tree(path)
                 else:
                     root_rels = ET.Element(f"{{{REL_NS}}}Relationships")
                     tree = ET.ElementTree(root_rels)
-                sheet_rels_cache[sheet_file] = tree
+                    nsmap = {"": REL_NS}
+                sheet_rels_cache[sheet_file] = (tree, nsmap)
                 return tree
 
             def _ensure_drawing_state(drawing_name: str) -> Optional[Dict[str, object]]:
@@ -1383,23 +1503,27 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                     return state
                 drawing_path = os.path.join(drawings_dir, drawing_name)
                 if os.path.exists(drawing_path):
-                    tree = ET.parse(drawing_path)
+                    tree, drawing_nsmap = _xml_parse_tree(drawing_path)
                 else:
                     root = ET.Element(f"{{{XDR_NS}}}wsDr")
                     tree = ET.ElementTree(root)
+                    drawing_nsmap = {"": XDR_NS}
                 root = tree.getroot()
                 drawing_rels_path = os.path.join(drawings_rels_dir, f"{drawing_name}.rels")
                 if os.path.exists(drawing_rels_path):
-                    rels_tree = ET.parse(drawing_rels_path)
+                    rels_tree, drawing_rels_nsmap = _xml_parse_tree(drawing_rels_path)
                 else:
                     rels_root = ET.Element(f"{{{REL_NS}}}Relationships")
                     rels_tree = ET.ElementTree(rels_root)
+                    drawing_rels_nsmap = {"": REL_NS}
                 state = {
                     "tree": tree,
                     "root": root,
+                    "nsmap": drawing_nsmap,
                     "path": drawing_path,
                     "rels_tree": rels_tree,
                     "rels_path": drawing_rels_path,
+                    "rels_nsmap": drawing_rels_nsmap,
                     "max_id": _xlsx_max_docpr_id(root),
                 }
                 drawing_cache[drawing_name] = state
@@ -1673,22 +1797,31 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
 
             _xlsx_update_content_types(tmpdir, used_media_exts, new_drawing_files)
 
-            for sheet_file, tree in sheet_tree_cache.items():
+            for sheet_file, (tree, nsmap) in sheet_tree_cache.items():
                 path = os.path.join(tmpdir, "xl", "worksheets", sheet_file)
-                tree.write(path, encoding="utf-8", xml_declaration=True)
-            for sheet_file, tree in sheet_rels_cache.items():
+                _xml_write_tree(tree, path, namespace_map=nsmap)
+            for sheet_file, (tree, nsmap) in sheet_rels_cache.items():
                 rels_dir = os.path.join(tmpdir, "xl", "worksheets", "_rels")
                 _xlsx_ensure_dir(rels_dir)
                 path = os.path.join(rels_dir, f"{sheet_file}.rels")
-                _xml_write_tree(tree, path, default_namespace=REL_NS)
+                default_ns = nsmap.get("") if nsmap else REL_NS
+                _xml_write_tree(tree, path, default_namespace=default_ns, namespace_map=nsmap)
             for drawing_name, state in drawing_cache.items():
                 tree = state["tree"]
                 rels_tree = state["rels_tree"]
                 path = state["path"]
                 rels_path = state["rels_path"]
-                tree.write(path, encoding="utf-8", xml_declaration=True)
+                tree_nsmap = state.get("nsmap") or {"": XDR_NS}
+                _xml_write_tree(tree, path, namespace_map=tree_nsmap)
                 _xlsx_ensure_dir(os.path.dirname(rels_path))
-                _xml_write_tree(rels_tree, rels_path, default_namespace=REL_NS)
+                rels_nsmap = state.get("rels_nsmap") or {"": REL_NS}
+                default_rels_ns = rels_nsmap.get("") if rels_nsmap else REL_NS
+                _xml_write_tree(
+                    rels_tree,
+                    rels_path,
+                    default_namespace=default_rels_ns,
+                    namespace_map=rels_nsmap,
+                )
 
         # 再計算フラグ
         xlsx_force_full_recalc(tmpdir)
