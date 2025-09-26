@@ -276,7 +276,13 @@ def _xml_write_tree(tree: ET.ElementTree, path: str, default_namespace: Optional
                 kwargs["default_namespace"] = default_namespace
             else:
                 kwargs["default_namespace"] = default_namespace
-    tree.write(path, **kwargs)
+    try:
+        tree.write(path, **kwargs)
+    except ValueError as exc:
+        if "non-qualified names" in str(exc) and kwargs.pop("default_namespace", None):
+            tree.write(path, **kwargs)
+        else:
+            raise
 
 def _word_set_text(node: LET._Element, text: str):
     run = node.getparent()
