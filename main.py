@@ -237,6 +237,8 @@ CONTENT_TYPES_NS = "http://schemas.openxmlformats.org/package/2006/content-types
 EMU_PER_INCH = 914400
 XDR_NS = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
 EMU_PER_PIXEL = 9525
+CALC_CHAIN_REL_TYPE = f"{R_NS}/calcChain"
+CALC_CHAIN_PART = "/xl/calcChain.xml"
 
 DOC_MIME_MAP = {
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -950,6 +952,32 @@ def xlsx_force_full_recalc(extracted_dir: str):
     if os.path.exists(chain):
         try: os.remove(chain)
         except: pass
+    rels_path = os.path.join(extracted_dir, "xl", "_rels", "workbook.xml.rels")
+    if os.path.exists(rels_path):
+        rels_tree = ET.parse(rels_path)
+        rels_root = rels_tree.getroot()
+        removed = False
+        for rel in list(rels_root.findall(f".//{{{REL_NS}}}Relationship")):
+            target = (rel.get("Target") or "").replace("\\", "/")
+            rel_type = rel.get("Type") or ""
+            if target.endswith("calcChain.xml") or rel_type == CALC_CHAIN_REL_TYPE:
+                rels_root.remove(rel)
+                removed = True
+        if removed:
+            _xml_write_tree(rels_tree, rels_path, default_namespace=REL_NS)
+    ct_path = os.path.join(extracted_dir, "[Content_Types].xml")
+    if os.path.exists(ct_path):
+        ct_tree = ET.parse(ct_path)
+        ct_root = ct_tree.getroot()
+        ns_ct = {"ct": CONTENT_TYPES_NS}
+        removed = False
+        for node in list(ct_root.findall("ct:Override", ns_ct)):
+            part = (node.get("PartName") or "").replace("\\", "/")
+            if part.lower() == CALC_CHAIN_PART.lower():
+                ct_root.remove(node)
+                removed = True
+        if removed:
+            _xml_write_tree(ct_tree, ct_path, default_namespace=CONTENT_TYPES_NS)
     tree.write(p, encoding="utf-8", xml_declaration=True)
 
 def _xlsx_escape_sheet_name(name: str) -> str:
