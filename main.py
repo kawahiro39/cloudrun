@@ -251,29 +251,11 @@ ET.register_namespace("s", S_NS)
 CELL_REF_RE = re.compile(r"^([A-Za-z]+)(\d+)$")
 
 
-def _xml_force_default_namespace(xml_text: str, namespace: Optional[str]) -> str:
-    if not namespace:
-        return xml_text
-
-    xml_text = re.sub(r"(<\/?)(ns\d+:)", r"\1", xml_text)
-
-    pattern = re.compile(rf"xmlns:ns\d+=([\"\']){re.escape(namespace)}([\"\'])")
-
-    def _replace(match: re.Match) -> str:
-        start = match.group(1)
-        end = match.group(2)
-        return f"xmlns={start}{namespace}{end}"
-
-    return pattern.sub(_replace, xml_text)
-
-
 def _xml_write_tree(tree: ET.ElementTree, path: str, default_namespace: Optional[str] = None):
-    buf = io.BytesIO()
-    tree.write(buf, encoding="utf-8", xml_declaration=True)
-    xml_text = buf.getvalue().decode("utf-8")
-    xml_text = _xml_force_default_namespace(xml_text, default_namespace)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(xml_text)
+    kwargs = {"encoding": "utf-8", "xml_declaration": True}
+    if default_namespace:
+        kwargs["default_namespace"] = default_namespace
+    tree.write(path, **kwargs)
 
 def _word_set_text(node: LET._Element, text: str):
     run = node.getparent()
@@ -933,7 +915,7 @@ def _xlsx_sheet_map(extracted_dir: str) -> Dict[str, Tuple[Optional[str], Option
     rid_to_target: Dict[str, str] = {}
     if os.path.exists(rels_xml):
         tree = ET.parse(rels_xml); root = tree.getroot()
-        for rel in root.findall(f".//{{{R_NS}}}Relationship"):
+        for rel in root.findall(f".//{{{REL_NS}}}Relationship"):
             if rel.get("Type", "").endswith("/worksheet"):
                 rid = rel.get("Id"); target = rel.get("Target")
                 if rid and target:
