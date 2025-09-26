@@ -235,6 +235,12 @@ CONTENT_TYPES_NS = "http://schemas.openxmlformats.org/package/2006/content-types
 EMU_PER_INCH = 914400
 XDR_NS = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
 EMU_PER_PIXEL = 9525
+
+# Ensure common OpenXML namespaces retain stable prefixes when serializing.
+ET.register_namespace("r", R_NS)
+ET.register_namespace("xdr", XDR_NS)
+ET.register_namespace("a", A_NS)
+ET.register_namespace("s", S_NS)
 CELL_REF_RE = re.compile(r"^([A-Za-z]+)(\d+)$")
 
 def _word_set_text(node: LET._Element, text: str):
@@ -1227,13 +1233,8 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                     tree = ET.parse(drawing_path)
                 else:
                     root = ET.Element(f"{{{XDR_NS}}}wsDr")
-                    root.set("xmlns:xdr", XDR_NS)
-                    root.set("xmlns:a", A_NS)
-                    root.set("xmlns:r", R_NS)
                     tree = ET.ElementTree(root)
                 root = tree.getroot()
-                if not any(attr == "xmlns:r" or attr.endswith("}r") for attr in root.attrib):
-                    root.set("xmlns:r", R_NS)
                 drawing_rels_path = os.path.join(drawings_rels_dir, f"{drawing_name}.rels")
                 if os.path.exists(drawing_rels_path):
                     rels_tree = ET.parse(drawing_rels_path)
@@ -1416,8 +1417,6 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                     if sheet_tree is None:
                         continue
                     sheet_root = sheet_tree.getroot()
-                    if not any(attr == "xmlns:r" or attr.endswith("}r") for attr in sheet_root.attrib):
-                        sheet_root.set("xmlns:r", R_NS)
 
                     sheet_rels_tree = _ensure_sheet_rels(sheet_file)
                     rels_root = sheet_rels_tree.getroot()
