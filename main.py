@@ -2,6 +2,7 @@ import os
 import re
 import io
 import base64
+import binascii
 import tempfile
 import zipfile
 import shutil
@@ -12,6 +13,7 @@ from decimal import Decimal
 from lxml import etree as LET
 from jinja2 import Environment, DebugUndefined
 from typing import Dict, Tuple, List, Optional, Set
+import urllib.parse
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -235,7 +237,43 @@ CONTENT_TYPES_NS = "http://schemas.openxmlformats.org/package/2006/content-types
 EMU_PER_INCH = 914400
 XDR_NS = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
 EMU_PER_PIXEL = 9525
+
+DOC_MIME_MAP = {
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
+
+# Ensure common OpenXML namespaces retain stable prefixes when serializing.
+ET.register_namespace("r", R_NS)
+ET.register_namespace("xdr", XDR_NS)
+ET.register_namespace("a", A_NS)
+ET.register_namespace("s", S_NS)
 CELL_REF_RE = re.compile(r"^([A-Za-z]+)(\d+)$")
+
+
+def _xml_force_default_namespace(xml_text: str, namespace: Optional[str]) -> str:
+    if not namespace:
+        return xml_text
+
+    xml_text = re.sub(r"(<\/?)(ns\d+:)", r"\1", xml_text)
+
+    pattern = re.compile(rf"xmlns:ns\d+=([\"\']){re.escape(namespace)}([\"\'])")
+
+    def _replace(match: re.Match) -> str:
+        start = match.group(1)
+        end = match.group(2)
+        return f"xmlns={start}{namespace}{end}"
+
+    return pattern.sub(_replace, xml_text)
+
+
+def _xml_write_tree(tree: ET.ElementTree, path: str, default_namespace: Optional[str] = None):
+    buf = io.BytesIO()
+    tree.write(buf, encoding="utf-8", xml_declaration=True)
+    xml_text = buf.getvalue().decode("utf-8")
+    xml_text = _xml_force_default_namespace(xml_text, default_namespace)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(xml_text)
 
 def _word_set_text(node: LET._Element, text: str):
     run = node.getparent()
@@ -776,6 +814,50 @@ def _xlsx_set_anchor_size(anchor_el: Optional[ET.Element], cx: int, cy: int):
         ext_el.set("cy", str(cy))
 
 
+def _decode_base64_payload(payload: str) -> Optional[bytes]:
+    data = (payload or "").strip()
+    if not data:
+        return None
+    padding = len(data) % 4
+    if padding:
+        data += "=" * (4 - padding)
+    try:
+        return base64.b64decode(data, validate=False)
+    except (binascii.Error, ValueError):
+        return None
+
+
+def _xlsx_fetch_image_bytes(source: str) -> Optional[bytes]:
+    if not source:
+        return None
+
+    text = source.strip()
+    if not text:
+        return None
+
+    if text.startswith("data:"):
+        header, _, payload = text.partition(",")
+        if not payload:
+            return None
+        if ";base64" in header:
+            return _decode_base64_payload(payload)
+        return urllib.parse.unquote_to_bytes(payload)
+
+    if text.startswith("base64:"):
+        _, _, payload = text.partition(":")
+        return _decode_base64_payload(payload)
+
+    if text.startswith("base64,"):
+        return _decode_base64_payload(text[7:])
+
+    try:
+        resp = requests.get(text, timeout=20)
+        resp.raise_for_status()
+        return resp.content
+    except Exception:
+        return None
+
+
 def _xlsx_update_content_types(extracted_dir: str, media_exts: Set[str], drawing_files: Set[str]):
     if not media_exts and not drawing_files:
         return
@@ -833,7 +915,7 @@ def _xlsx_update_content_types(extracted_dir: str, media_exts: Set[str], drawing
         changed = True
 
     if changed:
-        tree.write(path, encoding="utf-8", xml_declaration=True)
+        _xml_write_tree(tree, path, default_namespace=CONTENT_TYPES_NS)
 
 
 def _xlsx_ensure_dir(path: str):
@@ -1227,15 +1309,8 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                     tree = ET.parse(drawing_path)
                 else:
                     root = ET.Element(f"{{{XDR_NS}}}wsDr")
-                    root.set("xmlns:xdr", XDR_NS)
-                    root.set("xmlns:a", A_NS)
-                    root.set("xmlns:r", R_NS)
                     tree = ET.ElementTree(root)
                 root = tree.getroot()
-                if root.get(f"{{{XMLNS_NS}}}r") is None and not any(
-                    attr.endswith("}r") for attr in root.attrib
-                ):
-                    root.set(f"{{{XMLNS_NS}}}r", R_NS)
                 drawing_rels_path = os.path.join(drawings_rels_dir, f"{drawing_name}.rels")
                 if os.path.exists(drawing_rels_path):
                     rels_tree = ET.parse(drawing_rels_path)
@@ -1287,13 +1362,11 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                 if not url:
                     continue
                 mm = meta.get("mm") or size_hint
-                try:
-                    resp = requests.get(url, timeout=20)
-                    resp.raise_for_status()
-                except Exception:
+                raw_data = _xlsx_fetch_image_bytes(url)
+                if raw_data is None:
                     continue
                 try:
-                    img = PILImage.open(io.BytesIO(resp.content)).convert("RGBA")
+                    img = PILImage.open(io.BytesIO(raw_data)).convert("RGBA")
                 except Exception:
                     continue
                 if mm:
@@ -1307,7 +1380,7 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                     continue
                 buffer = io.BytesIO()
                 img.save(buffer, format="PNG")
-                data = buffer.getvalue()
+                png_bytes = buffer.getvalue()
                 buffer.close()
 
                 if source == "drawing":
@@ -1346,7 +1419,7 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
 
                     image_name = _next_media_name()
                     with open(os.path.join(media_dir, image_name), "wb") as f:
-                        f.write(data)
+                        f.write(png_bytes)
                     ext = os.path.splitext(image_name)[1].lstrip(".").lower()
                     if ext:
                         used_media_exts.add(ext)
@@ -1418,10 +1491,6 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                     if sheet_tree is None:
                         continue
                     sheet_root = sheet_tree.getroot()
-                    if sheet_root.get(f"{{{XMLNS_NS}}}r") is None and not any(
-                        attr.endswith("}r") for attr in sheet_root.attrib
-                    ):
-                        sheet_root.set(f"{{{XMLNS_NS}}}r", R_NS)
 
                     sheet_rels_tree = _ensure_sheet_rels(sheet_file)
                     rels_root = sheet_rels_tree.getroot()
@@ -1465,7 +1534,7 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
 
                     image_name = _next_media_name()
                     with open(os.path.join(media_dir, image_name), "wb") as f:
-                        f.write(data)
+                        f.write(png_bytes)
                     ext = os.path.splitext(image_name)[1].lstrip(".").lower()
                     if ext:
                         used_media_exts.add(ext)
@@ -1534,7 +1603,7 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                 rels_dir = os.path.join(tmpdir, "xl", "worksheets", "_rels")
                 _xlsx_ensure_dir(rels_dir)
                 path = os.path.join(rels_dir, f"{sheet_file}.rels")
-                tree.write(path, encoding="utf-8", xml_declaration=True)
+                _xml_write_tree(tree, path, default_namespace=REL_NS)
             for drawing_name, state in drawing_cache.items():
                 tree = state["tree"]
                 rels_tree = state["rels_tree"]
@@ -1542,7 +1611,7 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                 rels_path = state["rels_path"]
                 tree.write(path, encoding="utf-8", xml_declaration=True)
                 _xlsx_ensure_dir(os.path.dirname(rels_path))
-                rels_tree.write(rels_path, encoding="utf-8", xml_declaration=True)
+                _xml_write_tree(rels_tree, rels_path, default_namespace=REL_NS)
 
         # 再計算フラグ
         xlsx_force_full_recalc(tmpdir)
@@ -1606,6 +1675,9 @@ async def merge(
     filename: str = Form("document"),
     jpeg_dpi: int = Form(150),
     jpeg_pages: str = Form("1"),
+    return_pdf: bool = Form(True),
+    return_jpegs: bool = Form(True),
+    return_document: bool = Form(True),
     x_auth_id: Optional[str] = Header(None, alias="X-Auth-Id"),
     authorization: Optional[str] = Header(None),
 ):
@@ -1640,25 +1712,60 @@ async def merge(
             else:
                 xlsx_patch_and_place(src, rendered, text_map, image_map)
 
-            pdf_dir = os.path.join(td, "pdf")
-            pdf_path = libreoffice_to_pdf(rendered, pdf_dir)
+            pdf_bytes: Optional[bytes] = None
+            pdf_path: Optional[str] = None
+            total_pages: Optional[int] = None
 
-            with open(pdf_path, "rb") as f:
-                pdf_bytes = f.read()
+            if return_pdf or return_jpegs:
+                pdf_dir = os.path.join(td, "pdf")
+                pdf_path = libreoffice_to_pdf(rendered, pdf_dir)
+                with open(pdf_path, "rb") as f:
+                    pdf_bytes = f.read()
+                total_pages = len(PdfReader(io.BytesIO(pdf_bytes)).pages)
 
-            total_pages = len(PdfReader(io.BytesIO(pdf_bytes)).pages)
+            selected: List[int] = []
+            jpgs: List[Tuple[int, bytes]] = []
+            if return_jpegs:
+                if total_pages is None or pdf_path is None or pdf_bytes is None:
+                    raise RuntimeError("JPEG output requested but PDF generation failed")
+                selected = parse_pages_arg(jpeg_pages, total_pages)
+                jpgs = pdf_to_jpegs(pdf_path, jpeg_dpi, selected)
 
-            selected = parse_pages_arg(jpeg_pages, total_pages)
-            jpgs = pdf_to_jpegs(pdf_path, jpeg_dpi, selected)
+            response: Dict[str, object] = {}
 
-            return ok({
-                "file_name": (filename or "document").strip().rstrip(".") + ".pdf",
-                "pdf_data_uri": data_uri("application/pdf", pdf_bytes),
-                "jpeg_dpi": jpeg_dpi,
-                "jpeg_pages": selected,
-                "jpeg_data_uris": [{"page": p, "data_uri": data_uri("image/jpeg", b)} for p, b in jpgs],
-                "total_pdf_pages": total_pages
-            })
+            base_filename = (filename or "document").strip().rstrip(".")
+            if not base_filename:
+                base_filename = "document"
+
+            if return_pdf:
+                if pdf_bytes is None:
+                    raise RuntimeError("PDF output requested but PDF generation failed")
+                response["file_name"] = base_filename + ".pdf"
+                response["pdf_data_uri"] = data_uri("application/pdf", pdf_bytes)
+                if total_pages is not None:
+                    response["total_pdf_pages"] = total_pages
+
+            if return_jpegs:
+                response["jpeg_dpi"] = jpeg_dpi
+                response["jpeg_pages"] = selected
+                response["jpeg_data_uris"] = [
+                    {"page": p, "data_uri": data_uri("image/jpeg", b)}
+                    for p, b in jpgs
+                ]
+                if total_pages is not None:
+                    response["total_pdf_pages"] = total_pages
+
+            if return_document:
+                with open(rendered, "rb") as f:
+                    doc_bytes = f.read()
+                mime = DOC_MIME_MAP.get(ext, "application/octet-stream")
+                response["document_file_name"] = base_filename + ext
+                response["document_data_uri"] = data_uri(mime, doc_bytes)
+
+            if not response:
+                response["message"] = "No outputs requested"
+
+            return ok(response)
     except Exception as e:
         # 500 ではなく 400 を返す（Bubble 側で原因が見える）
         return err(str(e), 400)
