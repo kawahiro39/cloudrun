@@ -135,19 +135,28 @@ def parse_numberlike(s: str) -> Tuple[Optional[float], Optional[str]]:
         except: return None, None
     return None, None
 
-def _format_formula_value(value) -> Optional[str]:
+def _format_formula_value(value) -> Tuple[Optional[str], Optional[str]]:
+    """Return the serialized value and Excel type hint for a formula result."""
     if value is None:
-        return None
+        return None, None
+
+    type_hint: Optional[str] = None
+
     if isinstance(value, Decimal):
         if value == value.to_integral():
             value = int(value)
         else:
             value = float(value)
+
     if isinstance(value, bool):
-        return "1" if value else "0"
+        return ("1" if value else "0"), "b"
+
     if isinstance(value, (int, float)):
-        return str(value)
-    return str(value)
+        return str(value), None
+
+    text = str(value)
+    type_hint = "str"
+    return text, type_hint
 
 def _with_newlines(v: str) -> str:
     return (v or "").replace("<br>", "\n")
@@ -1027,7 +1036,7 @@ def xlsx_update_formula_caches(xlsx_path: str, formula_cells: List[Dict]):
     except Exception:
         return
 
-    computed: Dict[Tuple[str, str], Optional[str]] = {}
+    computed: Dict[Tuple[str, str], Dict[str, Optional[str]]] = {}
     fallbacks: Dict[Tuple[str, str], Dict[str, Optional[str]]] = {}
     needs_fallback_write = False
     sheet_names_by_index: List[str] = []
@@ -1069,10 +1078,10 @@ def xlsx_update_formula_caches(xlsx_path: str, formula_cells: List[Dict]):
             continue
         if hasattr(value, "value"):
             value = value.value
-        formatted = _format_formula_value(value)
+        formatted, type_hint = _format_formula_value(value)
         if formatted is None:
             continue
-        computed[key] = formatted
+        computed[key] = {"value": formatted, "type": type_hint}
 
     if not computed and not needs_fallback_write:
         return
@@ -1103,11 +1112,15 @@ def xlsx_update_formula_caches(xlsx_path: str, formula_cells: List[Dict]):
             if key in computed:
                 if v_node is None:
                     v_node = ET.SubElement(cell, f"{{{ns['s']}}}v")
-                v_node.text = computed[key]
-                if computed[key] in ("1", "0") and info.get("boolean", False):
+                result = computed[key]
+                v_node.text = result.get("value") or ""
+                type_hint = result.get("type")
+                if type_hint == "b":
                     cell.set("t", "b")
-                elif cell.get("t") == "str":
-                    cell.attrib.pop("t")
+                elif type_hint == "str":
+                    cell.set("t", "str")
+                else:
+                    cell.attrib.pop("t", None)
             else:
                 fallback = fallbacks.get(key, {})
                 original_value = fallback.get("value")
@@ -1232,7 +1245,6 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                             "sheet_name": sheet_name,
                             "sheet_index": sheet_index,
                             "cell_ref": r_attr,
-                            "boolean": (c.get("t") == "b"),
                             "original_value": v_node.text if v_node is not None else None,
                             "original_type": t_attr if t_attr is not None else None,
                         })
