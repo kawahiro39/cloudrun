@@ -256,7 +256,24 @@ CELL_REF_RE = re.compile(r"^([A-Za-z]+)(\d+)$")
 def _xml_write_tree(tree: ET.ElementTree, path: str, default_namespace: Optional[str] = None):
     kwargs = {"encoding": "utf-8", "xml_declaration": True}
     if default_namespace:
-        kwargs["default_namespace"] = default_namespace
+        try:
+            root = tree.getroot()
+        except Exception:
+            root = None
+
+        def _has_unqualified(el: Optional[ET.Element]) -> bool:
+            if el is None:
+                return False
+            for node in el.iter():
+                tag = getattr(node, "tag", None)
+                if not isinstance(tag, str):
+                    continue
+                if not tag.startswith("{"):
+                    return True
+            return False
+
+        if not _has_unqualified(root):
+            kwargs["default_namespace"] = default_namespace
     tree.write(path, **kwargs)
 
 def _word_set_text(node: LET._Element, text: str):
