@@ -250,6 +250,31 @@ ET.register_namespace("a", A_NS)
 ET.register_namespace("s", S_NS)
 CELL_REF_RE = re.compile(r"^([A-Za-z]+)(\d+)$")
 
+
+def _xml_force_default_namespace(xml_text: str, namespace: Optional[str]) -> str:
+    if not namespace:
+        return xml_text
+
+    xml_text = re.sub(r"(<\/?)(ns\d+:)", r"\1", xml_text)
+
+    pattern = re.compile(rf"xmlns:ns\d+=([\"\']){re.escape(namespace)}([\"\'])")
+
+    def _replace(match: re.Match) -> str:
+        start = match.group(1)
+        end = match.group(2)
+        return f"xmlns={start}{namespace}{end}"
+
+    return pattern.sub(_replace, xml_text)
+
+
+def _xml_write_tree(tree: ET.ElementTree, path: str, default_namespace: Optional[str] = None):
+    buf = io.BytesIO()
+    tree.write(buf, encoding="utf-8", xml_declaration=True)
+    xml_text = buf.getvalue().decode("utf-8")
+    xml_text = _xml_force_default_namespace(xml_text, default_namespace)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(xml_text)
+
 def _word_set_text(node: LET._Element, text: str):
     run = node.getparent()
     if run is None or run.tag != f"{{{W_NS}}}r":
@@ -890,7 +915,7 @@ def _xlsx_update_content_types(extracted_dir: str, media_exts: Set[str], drawing
         changed = True
 
     if changed:
-        tree.write(path, encoding="utf-8", xml_declaration=True)
+        _xml_write_tree(tree, path, default_namespace=CONTENT_TYPES_NS)
 
 
 def _xlsx_ensure_dir(path: str):
@@ -1578,7 +1603,7 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                 rels_dir = os.path.join(tmpdir, "xl", "worksheets", "_rels")
                 _xlsx_ensure_dir(rels_dir)
                 path = os.path.join(rels_dir, f"{sheet_file}.rels")
-                tree.write(path, encoding="utf-8", xml_declaration=True)
+                _xml_write_tree(tree, path, default_namespace=REL_NS)
             for drawing_name, state in drawing_cache.items():
                 tree = state["tree"]
                 rels_tree = state["rels_tree"]
@@ -1586,7 +1611,7 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                 rels_path = state["rels_path"]
                 tree.write(path, encoding="utf-8", xml_declaration=True)
                 _xlsx_ensure_dir(os.path.dirname(rels_path))
-                rels_tree.write(rels_path, encoding="utf-8", xml_declaration=True)
+                _xml_write_tree(rels_tree, rels_path, default_namespace=REL_NS)
 
         # 再計算フラグ
         xlsx_force_full_recalc(tmpdir)
