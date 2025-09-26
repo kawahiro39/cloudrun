@@ -261,19 +261,21 @@ def _xml_write_tree(tree: ET.ElementTree, path: str, default_namespace: Optional
         except Exception:
             root = None
 
-        def _has_unqualified(el: Optional[ET.Element]) -> bool:
-            if el is None:
-                return False
-            for node in el.iter():
+        if root is not None:
+            missing: List[ET.Element] = []
+            for node in root.iter():
                 tag = getattr(node, "tag", None)
                 if not isinstance(tag, str):
                     continue
                 if not tag.startswith("{"):
-                    return True
-            return False
+                    missing.append(node)
 
-        if not _has_unqualified(root):
-            kwargs["default_namespace"] = default_namespace
+            if missing:
+                for node in missing:
+                    node.tag = f"{{{default_namespace}}}{node.tag}"
+                kwargs["default_namespace"] = default_namespace
+            else:
+                kwargs["default_namespace"] = default_namespace
     tree.write(path, **kwargs)
 
 def _word_set_text(node: LET._Element, text: str):
