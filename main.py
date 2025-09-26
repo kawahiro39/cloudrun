@@ -762,7 +762,6 @@ def _xlsx_find_drawing_placeholders(drawings_dir: str, drawing_to_sheet: Dict[st
 
     return placements
 
-
 def _xlsx_ensure_dir(path: str):
     if not os.path.isdir(path):
         os.makedirs(path, exist_ok=True)
