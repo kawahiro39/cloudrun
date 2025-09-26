@@ -6,6 +6,7 @@ import tempfile
 import zipfile
 import shutil
 import subprocess
+import threading
 import xml.etree.ElementTree as ET
 from decimal import Decimal
 from lxml import etree as LET
@@ -13,11 +14,25 @@ from jinja2 import Environment, DebugUndefined
 from typing import Dict, Tuple, List, Optional
 
 import requests
+from requests.adapters import HTTPAdapter
 
 from fastapi import FastAPI, UploadFile, File, Form, Header
 from fastapi.responses import JSONResponse
 
 DEFAULT_AUTH_API_BASE_URL = "https://auth-677366504119.asia-northeast1.run.app"
+
+_AUTH_SESSION_LOCAL = threading.local()
+
+
+def _get_auth_session() -> requests.Session:
+    session = getattr(_AUTH_SESSION_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=8, pool_maxsize=8)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        _AUTH_SESSION_LOCAL.session = session
+    return session
 
 app = FastAPI(title="Doc/Excel → PDF & JPEG API (stable)")
 
@@ -60,8 +75,9 @@ def validate_auth_id(auth_id: str) -> bool:
 
     url = f"{base_url}/auth-ids/verify"
     payload = {"auth_id": auth_id}
+    session = _get_auth_session()
     try:
-        resp = requests.post(url, json=payload, timeout=_auth_api_timeout())
+        resp = session.post(url, json=payload, timeout=_auth_api_timeout())
     except requests.RequestException as exc:
         raise RuntimeError(f"auth_id validation request failed: {exc}")
 
@@ -1067,15 +1083,16 @@ async def merge(
             pdf_path = libreoffice_to_pdf(rendered, pdf_dir)
 
             with open(pdf_path, "rb") as f:
-                total_pages = len(PdfReader(f).pages)
+                pdf_bytes = f.read()
+
+            total_pages = len(PdfReader(io.BytesIO(pdf_bytes)).pages)
 
             selected = parse_pages_arg(jpeg_pages, total_pages)
             jpgs = pdf_to_jpegs(pdf_path, jpeg_dpi, selected)
 
-            pdf_b = open(pdf_path, "rb").read()
             return ok({
                 "file_name": (filename or "document").strip().rstrip(".") + ".pdf",
-                "pdf_data_uri": data_uri("application/pdf", pdf_b),
+                "pdf_data_uri": data_uri("application/pdf", pdf_bytes),
                 "jpeg_dpi": jpeg_dpi,
                 "jpeg_pages": selected,
                 "jpeg_data_uris": [{"page": p, "data_uri": data_uri("image/jpeg", b)} for p, b in jpgs],
