@@ -11,7 +11,7 @@ import xml.etree.ElementTree as ET
 from decimal import Decimal
 from lxml import etree as LET
 from jinja2 import Environment, DebugUndefined
-from typing import Dict, Tuple, List, Optional
+from typing import Dict, Tuple, List, Optional, Set
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -231,6 +231,7 @@ A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
 PIC_NS = "http://schemas.openxmlformats.org/drawingml/2006/picture"
 XML_NS = "http://www.w3.org/XML/1998/namespace"
 XMLNS_NS = "http://www.w3.org/2000/xmlns/"
+CONTENT_TYPES_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
 EMU_PER_INCH = 914400
 XDR_NS = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
 EMU_PER_PIXEL = 9525
@@ -715,14 +716,12 @@ def _xlsx_find_drawing_placeholders(drawings_dir: str, drawing_to_sheet: Dict[st
             if sp is None:
                 continue
 
-            target_var = None
-            size_hint = None
+            text_fragments: List[str] = []
             for t_node in sp.findall(".//a:t", ns):
-                var, hint = parse_image_tag(t_node.text or "")
-                if var:
-                    target_var = var
-                    size_hint = hint
-                    break
+                if t_node.text:
+                    text_fragments.append(t_node.text)
+            combined_text = "".join(text_fragments).strip()
+            target_var, size_hint = parse_image_tag(combined_text)
 
             if not target_var:
                 continue
@@ -761,6 +760,81 @@ def _xlsx_find_drawing_placeholders(drawings_dir: str, drawing_to_sheet: Dict[st
             })
 
     return placements
+
+
+def _xlsx_set_anchor_size(anchor_el: Optional[ET.Element], cx: int, cy: int):
+    if anchor_el is None:
+        return
+
+    ns = {"xdr": XDR_NS}
+    tag = anchor_el.tag
+    if tag in {f"{{{XDR_NS}}}oneCellAnchor", f"{{{XDR_NS}}}absoluteAnchor"}:
+        ext_el = anchor_el.find("xdr:ext", ns)
+        if ext_el is None:
+            ext_el = ET.SubElement(anchor_el, f"{{{XDR_NS}}}ext")
+        ext_el.set("cx", str(cx))
+        ext_el.set("cy", str(cy))
+
+
+def _xlsx_update_content_types(extracted_dir: str, media_exts: Set[str], drawing_files: Set[str]):
+    if not media_exts and not drawing_files:
+        return
+
+    path = os.path.join(extracted_dir, "[Content_Types].xml")
+    if not os.path.exists(path):
+        return
+
+    try:
+        tree = ET.parse(path)
+    except Exception:
+        return
+
+    root = tree.getroot()
+    if root is None:
+        return
+
+    changed = False
+    ns = {"ct": CONTENT_TYPES_NS}
+    defaults = {}
+    for node in root.findall("ct:Default", ns):
+        ext = (node.get("Extension") or "").lower()
+        if ext:
+            defaults[ext] = node
+
+    media_map = {
+        "png": "image/png",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+    }
+    for ext in sorted(media_exts):
+        lower = ext.lower()
+        if lower in defaults:
+            continue
+        content_type = media_map.get(lower, f"image/{lower}")
+        node = ET.SubElement(root, f"{{{CONTENT_TYPES_NS}}}Default")
+        node.set("Extension", lower)
+        node.set("ContentType", content_type)
+        changed = True
+
+    overrides = {}
+    for node in root.findall("ct:Override", ns):
+        part = node.get("PartName") or ""
+        if part:
+            overrides[part] = node
+
+    drawing_content_type = "application/vnd.openxmlformats-officedocument.drawing+xml"
+    for drawing_name in sorted(drawing_files):
+        part = f"/xl/drawings/{drawing_name}"
+        if part in overrides:
+            continue
+        node = ET.SubElement(root, f"{{{CONTENT_TYPES_NS}}}Override")
+        node.set("PartName", part)
+        node.set("ContentType", drawing_content_type)
+        changed = True
+
+    if changed:
+        tree.write(path, encoding="utf-8", xml_declaration=True)
+
 
 def _xlsx_ensure_dir(path: str):
     if not os.path.isdir(path):
@@ -1115,6 +1189,8 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
             sheet_tree_cache: Dict[str, ET.ElementTree] = {}
             sheet_rels_cache: Dict[str, ET.ElementTree] = {}
             drawing_cache: Dict[str, Dict[str, object]] = {}
+            used_media_exts: Set[str] = set()
+            new_drawing_files: Set[str] = set()
 
             def _ensure_sheet_tree(sheet_file: str) -> Optional[ET.ElementTree]:
                 tree = sheet_tree_cache.get(sheet_file)
@@ -1271,6 +1347,9 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                     image_name = _next_media_name()
                     with open(os.path.join(media_dir, image_name), "wb") as f:
                         f.write(data)
+                    ext = os.path.splitext(image_name)[1].lstrip(".").lower()
+                    if ext:
+                        used_media_exts.add(ext)
 
                     rels_tree = state["rels_tree"]
                     rels_root_drawing = rels_tree.getroot()
@@ -1285,7 +1364,10 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                     c_nv_pr = ET.SubElement(nv_pic, f"{{{XDR_NS}}}cNvPr")
                     c_nv_pr.set("id", str(docpr_int))
                     c_nv_pr.set("name", shape_name)
-                    ET.SubElement(nv_pic, f"{{{XDR_NS}}}cNvPicPr")
+                    c_nv_pic_pr = ET.SubElement(nv_pic, f"{{{XDR_NS}}}cNvPicPr")
+                    pic_locks = ET.SubElement(c_nv_pic_pr, f"{{{A_NS}}}picLocks")
+                    pic_locks.set("noChangeAspect", "1")
+                    pic_locks.set("noChangeArrowheads", "1")
 
                     blip_fill = ET.SubElement(pic, f"{{{XDR_NS}}}blipFill")
                     blip = ET.SubElement(blip_fill, f"{{{A_NS}}}blip")
@@ -1318,6 +1400,7 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                     ext = ET.SubElement(xfrm, f"{{{A_NS}}}ext")
                     ext.set("cx", str(cx_val))
                     ext.set("cy", str(cy_val))
+                    _xlsx_set_anchor_size(anchor_el, cx_val, cy_val)
                     prst = ET.SubElement(sp_pr, f"{{{A_NS}}}prstGeom")
                     prst.set("prst", "rect")
                     ET.SubElement(prst, f"{{{A_NS}}}avLst")
@@ -1367,6 +1450,8 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                         drawing_rel.set("Target", f"../drawings/{target_drawing_name}")
                         drawing_el = ET.SubElement(sheet_root, f"{{{S_NS}}}drawing")
                         drawing_el.set(f"{{{R_NS}}}id", drawing_rel_id)
+                        new_drawing_files.add(target_drawing_name)
+
                     else:
                         target_drawing_name = os.path.basename(drawing_rel.get("Target", ""))
                         drawing_rel_id = drawing_rel.get("Id")
@@ -1381,6 +1466,9 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                     image_name = _next_media_name()
                     with open(os.path.join(media_dir, image_name), "wb") as f:
                         f.write(data)
+                    ext = os.path.splitext(image_name)[1].lstrip(".").lower()
+                    if ext:
+                        used_media_exts.add(ext)
 
                     rels_tree = state["rels_tree"]
                     rels_root_drawing = rels_tree.getroot()
@@ -1410,7 +1498,10 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                     c_nv_pr = ET.SubElement(nv_pic, f"{{{XDR_NS}}}cNvPr")
                     c_nv_pr.set("id", str(docpr_id))
                     c_nv_pr.set("name", f"Picture {docpr_id}")
-                    ET.SubElement(nv_pic, f"{{{XDR_NS}}}cNvPicPr")
+                    c_nv_pic_pr = ET.SubElement(nv_pic, f"{{{XDR_NS}}}cNvPicPr")
+                    pic_locks = ET.SubElement(c_nv_pic_pr, f"{{{A_NS}}}picLocks")
+                    pic_locks.set("noChangeAspect", "1")
+                    pic_locks.set("noChangeArrowheads", "1")
 
                     blip_fill = ET.SubElement(pic, f"{{{XDR_NS}}}blipFill")
                     blip = ET.SubElement(blip_fill, f"{{{A_NS}}}blip")
@@ -1426,11 +1517,15 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                     ext = ET.SubElement(xfrm, f"{{{A_NS}}}ext")
                     ext.set("cx", str(cx))
                     ext.set("cy", str(cy))
+                    _xlsx_set_anchor_size(anchor, cx, cy)
+
                     prst = ET.SubElement(sp_pr, f"{{{A_NS}}}prstGeom")
                     prst.set("prst", "rect")
                     ET.SubElement(prst, f"{{{A_NS}}}avLst")
 
                     ET.SubElement(anchor, f"{{{XDR_NS}}}clientData")
+
+            _xlsx_update_content_types(tmpdir, used_media_exts, new_drawing_files)
 
             for sheet_file, tree in sheet_tree_cache.items():
                 path = os.path.join(tmpdir, "xl", "worksheets", sheet_file)
