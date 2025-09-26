@@ -1232,10 +1232,8 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                     root.set("xmlns:r", R_NS)
                     tree = ET.ElementTree(root)
                 root = tree.getroot()
-                if root.get(f"{{{XMLNS_NS}}}r") is None and not any(
-                    attr.endswith("}r") for attr in root.attrib
-                ):
-                    root.set(f"{{{XMLNS_NS}}}r", R_NS)
+                if not any(attr == "xmlns:r" or attr.endswith("}r") for attr in root.attrib):
+                    root.set("xmlns:r", R_NS)
                 drawing_rels_path = os.path.join(drawings_rels_dir, f"{drawing_name}.rels")
                 if os.path.exists(drawing_rels_path):
                     rels_tree = ET.parse(drawing_rels_path)
@@ -1418,10 +1416,8 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                     if sheet_tree is None:
                         continue
                     sheet_root = sheet_tree.getroot()
-                    if sheet_root.get(f"{{{XMLNS_NS}}}r") is None and not any(
-                        attr.endswith("}r") for attr in sheet_root.attrib
-                    ):
-                        sheet_root.set(f"{{{XMLNS_NS}}}r", R_NS)
+                    if not any(attr == "xmlns:r" or attr.endswith("}r") for attr in sheet_root.attrib):
+                        sheet_root.set("xmlns:r", R_NS)
 
                     sheet_rels_tree = _ensure_sheet_rels(sheet_file)
                     rels_root = sheet_rels_tree.getroot()
