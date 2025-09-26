@@ -680,6 +680,88 @@ def _xlsx_max_docpr_id(root: ET.Element) -> int:
     return max_id
 
 
+def _xlsx_find_drawing_placeholders(drawings_dir: str, drawing_to_sheet: Dict[str, List[Dict[str, object]]]) -> List[Dict[str, object]]:
+    placements: List[Dict[str, object]] = []
+    if not os.path.isdir(drawings_dir):
+        return placements
+
+    ns = {"xdr": XDR_NS, "a": A_NS}
+
+    for drawing_name, sheet_infos in drawing_to_sheet.items():
+        path = os.path.join(drawings_dir, drawing_name)
+        if not os.path.exists(path):
+            continue
+        try:
+            tree = ET.parse(path)
+        except Exception:
+            continue
+
+        root = tree.getroot()
+        anchors = list(root)
+        if not anchors:
+            continue
+
+        sheet_info = sheet_infos[0] if sheet_infos else {}
+
+        for idx, anchor in enumerate(anchors):
+            if anchor.tag not in {
+                f"{{{XDR_NS}}}oneCellAnchor",
+                f"{{{XDR_NS}}}twoCellAnchor",
+                f"{{{XDR_NS}}}absoluteAnchor",
+            }:
+                continue
+
+            sp = anchor.find("xdr:sp", ns)
+            if sp is None:
+                continue
+
+            target_var = None
+            size_hint = None
+            for t_node in sp.findall(".//a:t", ns):
+                var, hint = parse_image_tag(t_node.text or "")
+                if var:
+                    target_var = var
+                    size_hint = hint
+                    break
+
+            if not target_var:
+                continue
+
+            c_nv_pr = sp.find("xdr:nvSpPr/xdr:cNvPr", ns)
+            docpr_id = c_nv_pr.get("id") if c_nv_pr is not None else None
+            shape_name = c_nv_pr.get("name") if c_nv_pr is not None else None
+
+            off_x = off_y = cx = cy = None
+            xfrm = sp.find("xdr:spPr/a:xfrm", ns)
+            if xfrm is not None:
+                off = xfrm.find("a:off", ns)
+                ext = xfrm.find("a:ext", ns)
+                if off is not None:
+                    off_x = off.get("x")
+                    off_y = off.get("y")
+                if ext is not None:
+                    cx = ext.get("cx")
+                    cy = ext.get("cy")
+
+            placements.append({
+                "source": "drawing",
+                "drawing_name": drawing_name,
+                "anchor_index": idx,
+                "var": target_var,
+                "size_hint": size_hint,
+                "sheet_file": sheet_info.get("sheet_file"),
+                "sheet_name": sheet_info.get("sheet_name"),
+                "sheet_index": sheet_info.get("sheet_index"),
+                "docpr_id": docpr_id,
+                "shape_name": shape_name,
+                "off_x": off_x,
+                "off_y": off_y,
+                "cx": cx,
+                "cy": cy,
+            })
+
+    return placements
+
 def _xlsx_ensure_dir(path: str):
     if not os.path.isdir(path):
         os.makedirs(path, exist_ok=True)
@@ -846,6 +928,7 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
     tmpdir = tempfile.mkdtemp()
     placements: List[Dict[str, object]] = []
     formula_cells: List[Dict[str, object]] = []
+    sheet_drawings: Dict[str, List[Dict[str, object]]] = {}
     try:
         with zipfile.ZipFile(src_xlsx, 'r') as zin:
             zin.extractall(tmpdir)
@@ -904,6 +987,24 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                 if sheet_index is None:
                     m = re.findall(r'\d+', fn)
                     sheet_index = int(m[0]) - 1 if m else 0
+
+                rels_path = os.path.join(tmpdir, "xl", "worksheets", "_rels", f"{fn}.rels")
+                if os.path.exists(rels_path):
+                    try:
+                        rels_tree = ET.parse(rels_path)
+                        rels_root = rels_tree.getroot()
+                        for rel in rels_root.findall(f"{{{REL_NS}}}Relationship"):
+                            if rel.get("Type") == f"{R_NS}/drawing":
+                                target = (rel.get("Target") or "").replace('\\', '/')
+                                drawing_name = os.path.basename(target)
+                                if drawing_name:
+                                    sheet_drawings.setdefault(drawing_name, []).append({
+                                        "sheet_file": fn,
+                                        "sheet_name": sheet_name,
+                                        "sheet_index": sheet_index,
+                                    })
+                    except Exception:
+                        pass
 
                 for c in root.findall(".//s:c", ns):
                     t_attr = c.get("t")
@@ -990,6 +1091,12 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                             t_inline.text = replaced
 
                 tree.write(p, encoding="utf-8", xml_declaration=True)
+
+        drawings_dir = os.path.join(tmpdir, "xl", "drawings")
+        if image_map:
+            drawing_placeholders = _xlsx_find_drawing_placeholders(drawings_dir, sheet_drawings)
+            if drawing_placeholders:
+                placements.extend(drawing_placeholders)
 
         # 画像の配置
         if placements and image_map:
@@ -1080,15 +1187,26 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                     idx += 1
 
             for item in placements:
-                sheet_file = item.get("sheet_file")
-                cell_ref = item.get("cell_ref")
                 var = item.get("var")
-                size_hint = item.get("size_hint")
-                if not sheet_file or not cell_ref or not var:
+                if not var:
                     continue
                 meta = image_map.get(var)
                 if not meta:
                     continue
+
+                source = item.get("source")
+                sheet_file = item.get("sheet_file")
+                cell_ref = item.get("cell_ref")
+                size_hint = item.get("size_hint")
+                drawing_name = item.get("drawing_name")
+
+                if source == "drawing":
+                    if not drawing_name:
+                        continue
+                else:
+                    if not sheet_file or not cell_ref:
+                        continue
+
                 url = meta.get("url")
                 if not url:
                     continue
@@ -1116,110 +1234,203 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                 data = buffer.getvalue()
                 buffer.close()
 
-                col_idx, row_idx = _xlsx_cell_to_coords(cell_ref)
-                if col_idx is None or row_idx is None:
-                    continue
+                if source == "drawing":
+                    state = _ensure_drawing_state(drawing_name)
+                    if not state:
+                        continue
 
-                sheet_tree = _ensure_sheet_tree(sheet_file)
-                if sheet_tree is None:
-                    continue
-                sheet_root = sheet_tree.getroot()
-                if sheet_root.get(f"{{{XMLNS_NS}}}r") is None and not any(
-                    attr.endswith("}r") for attr in sheet_root.attrib
-                ):
-                    sheet_root.set(f"{{{XMLNS_NS}}}r", R_NS)
+                    root = state["root"]
+                    anchors = list(root)
+                    anchor_index = item.get("anchor_index")
+                    if anchor_index is None or anchor_index >= len(anchors):
+                        continue
+                    anchor_el = anchors[anchor_index]
+                    sp_el = anchor_el.find(f"{{{XDR_NS}}}sp")
+                    if sp_el is None:
+                        continue
 
-                sheet_rels_tree = _ensure_sheet_rels(sheet_file)
-                rels_root = sheet_rels_tree.getroot()
+                    current_max = int(state.get("max_id", 0))
+                    docpr_id_val = item.get("docpr_id")
+                    try:
+                        docpr_int = int(docpr_id_val)
+                    except (TypeError, ValueError):
+                        docpr_int = None
+                    if docpr_int is None:
+                        docpr_int = current_max + 1
+                    state["max_id"] = max(current_max, docpr_int)
 
-                drawing_rel = None
-                for rel in rels_root.findall(f"{{{REL_NS}}}Relationship"):
-                    if rel.get("Type") == f"{R_NS}/drawing":
-                        drawing_rel = rel
-                        break
+                    shape_name = item.get("shape_name") or f"Picture {docpr_int}"
 
-                drawing_name = None
-                drawing_rel_id = None
-                if drawing_rel is None:
-                    drawing_rel_id = _xlsx_next_rel_id(rels_root)
-                    next_idx = 1
-                    while True:
-                        candidate = f"drawing{next_idx}.xml"
-                        if candidate not in existing_drawings:
-                            drawing_name = candidate
-                            existing_drawings.add(candidate)
+                    insert_pos = None
+                    for child_idx, child in enumerate(list(anchor_el)):
+                        if child.tag == f"{{{XDR_NS}}}sp":
+                            insert_pos = child_idx
+                            anchor_el.remove(child)
                             break
-                        next_idx += 1
-                    drawing_rel = ET.SubElement(rels_root, f"{{{REL_NS}}}Relationship")
-                    drawing_rel.set("Id", drawing_rel_id)
-                    drawing_rel.set("Type", f"{R_NS}/drawing")
-                    drawing_rel.set("Target", f"../drawings/{drawing_name}")
-                    drawing_el = ET.SubElement(sheet_root, f"{{{S_NS}}}drawing")
-                    drawing_el.set(f"{{{R_NS}}}id", drawing_rel_id)
+
+                    image_name = _next_media_name()
+                    with open(os.path.join(media_dir, image_name), "wb") as f:
+                        f.write(data)
+
+                    rels_tree = state["rels_tree"]
+                    rels_root_drawing = rels_tree.getroot()
+                    img_rid = _xlsx_next_rel_id(rels_root_drawing)
+                    rel = ET.SubElement(rels_root_drawing, f"{{{REL_NS}}}Relationship")
+                    rel.set("Id", img_rid)
+                    rel.set("Type", f"{R_NS}/image")
+                    rel.set("Target", f"../media/{image_name}")
+
+                    pic = ET.Element(f"{{{XDR_NS}}}pic")
+                    nv_pic = ET.SubElement(pic, f"{{{XDR_NS}}}nvPicPr")
+                    c_nv_pr = ET.SubElement(nv_pic, f"{{{XDR_NS}}}cNvPr")
+                    c_nv_pr.set("id", str(docpr_int))
+                    c_nv_pr.set("name", shape_name)
+                    ET.SubElement(nv_pic, f"{{{XDR_NS}}}cNvPicPr")
+
+                    blip_fill = ET.SubElement(pic, f"{{{XDR_NS}}}blipFill")
+                    blip = ET.SubElement(blip_fill, f"{{{A_NS}}}blip")
+                    blip.set(f"{{{R_NS}}}embed", img_rid)
+                    stretch = ET.SubElement(blip_fill, f"{{{A_NS}}}stretch")
+                    ET.SubElement(stretch, f"{{{A_NS}}}fillRect")
+
+                    sp_pr = ET.SubElement(pic, f"{{{XDR_NS}}}spPr")
+                    xfrm = ET.SubElement(sp_pr, f"{{{A_NS}}}xfrm")
+                    off = ET.SubElement(xfrm, f"{{{A_NS}}}off")
+                    off.set("x", item.get("off_x") or "0")
+                    off.set("y", item.get("off_y") or "0")
+
+                    if mm:
+                        cx_val = max(1, int(round(img.size[0] * EMU_PER_PIXEL)))
+                        cy_val = max(1, int(round(img.size[1] * EMU_PER_PIXEL)))
+                    else:
+                        cx_val = cy_val = None
+                        try:
+                            if item.get("cx"):
+                                cx_val = max(1, int(item.get("cx")))
+                            if item.get("cy"):
+                                cy_val = max(1, int(item.get("cy")))
+                        except (TypeError, ValueError):
+                            cx_val = cy_val = None
+                        if cx_val is None or cy_val is None:
+                            cx_val = max(1, int(round(img.size[0] * EMU_PER_PIXEL)))
+                            cy_val = max(1, int(round(img.size[1] * EMU_PER_PIXEL)))
+
+                    ext = ET.SubElement(xfrm, f"{{{A_NS}}}ext")
+                    ext.set("cx", str(cx_val))
+                    ext.set("cy", str(cy_val))
+                    prst = ET.SubElement(sp_pr, f"{{{A_NS}}}prstGeom")
+                    prst.set("prst", "rect")
+                    ET.SubElement(prst, f"{{{A_NS}}}avLst")
+
+                    if insert_pos is None:
+                        anchor_el.append(pic)
+                    else:
+                        anchor_el.insert(insert_pos, pic)
                 else:
-                    drawing_name = os.path.basename(drawing_rel.get("Target", ""))
-                    drawing_rel_id = drawing_rel.get("Id")
+                    col_idx, row_idx = _xlsx_cell_to_coords(cell_ref)
+                    if col_idx is None or row_idx is None:
+                        continue
 
-                if not drawing_name:
-                    continue
+                    sheet_tree = _ensure_sheet_tree(sheet_file)
+                    if sheet_tree is None:
+                        continue
+                    sheet_root = sheet_tree.getroot()
+                    if sheet_root.get(f"{{{XMLNS_NS}}}r") is None and not any(
+                        attr.endswith("}r") for attr in sheet_root.attrib
+                    ):
+                        sheet_root.set(f"{{{XMLNS_NS}}}r", R_NS)
 
-                state = _ensure_drawing_state(drawing_name)
-                if not state:
-                    continue
+                    sheet_rels_tree = _ensure_sheet_rels(sheet_file)
+                    rels_root = sheet_rels_tree.getroot()
 
-                image_name = _next_media_name()
-                with open(os.path.join(media_dir, image_name), "wb") as f:
-                    f.write(data)
+                    drawing_rel = None
+                    for rel in rels_root.findall(f"{{{REL_NS}}}Relationship"):
+                        if rel.get("Type") == f"{R_NS}/drawing":
+                            drawing_rel = rel
+                            break
 
-                rels_tree = state["rels_tree"]
-                rels_root_drawing = rels_tree.getroot()
-                img_rid = _xlsx_next_rel_id(rels_root_drawing)
-                rel = ET.SubElement(rels_root_drawing, f"{{{REL_NS}}}Relationship")
-                rel.set("Id", img_rid)
-                rel.set("Type", f"{R_NS}/image")
-                rel.set("Target", f"../media/{image_name}")
+                    target_drawing_name = None
+                    drawing_rel_id = None
+                    if drawing_rel is None:
+                        drawing_rel_id = _xlsx_next_rel_id(rels_root)
+                        next_idx = 1
+                        while True:
+                            candidate = f"drawing{next_idx}.xml"
+                            if candidate not in existing_drawings:
+                                target_drawing_name = candidate
+                                existing_drawings.add(candidate)
+                                break
+                            next_idx += 1
+                        drawing_rel = ET.SubElement(rels_root, f"{{{REL_NS}}}Relationship")
+                        drawing_rel.set("Id", drawing_rel_id)
+                        drawing_rel.set("Type", f"{R_NS}/drawing")
+                        drawing_rel.set("Target", f"../drawings/{target_drawing_name}")
+                        drawing_el = ET.SubElement(sheet_root, f"{{{S_NS}}}drawing")
+                        drawing_el.set(f"{{{R_NS}}}id", drawing_rel_id)
+                    else:
+                        target_drawing_name = os.path.basename(drawing_rel.get("Target", ""))
+                        drawing_rel_id = drawing_rel.get("Id")
 
-                root = state["root"]
-                state["max_id"] = int(state.get("max_id", 0)) + 1
-                docpr_id = state["max_id"]
+                    if not target_drawing_name:
+                        continue
 
-                anchor = ET.SubElement(root, f"{{{XDR_NS}}}oneCellAnchor")
-                from_el = ET.SubElement(anchor, f"{{{XDR_NS}}}from")
-                ET.SubElement(from_el, f"{{{XDR_NS}}}col").text = str(col_idx)
-                ET.SubElement(from_el, f"{{{XDR_NS}}}colOff").text = "0"
-                ET.SubElement(from_el, f"{{{XDR_NS}}}row").text = str(row_idx)
-                ET.SubElement(from_el, f"{{{XDR_NS}}}rowOff").text = "0"
+                    state = _ensure_drawing_state(target_drawing_name)
+                    if not state:
+                        continue
 
-                cx = max(1, int(round(img.size[0] * EMU_PER_PIXEL)))
-                cy = max(1, int(round(img.size[1] * EMU_PER_PIXEL)))
+                    image_name = _next_media_name()
+                    with open(os.path.join(media_dir, image_name), "wb") as f:
+                        f.write(data)
 
-                ET.SubElement(anchor, f"{{{XDR_NS}}}ext", {"cx": str(cx), "cy": str(cy)})
-                pic = ET.SubElement(anchor, f"{{{XDR_NS}}}pic")
-                nv_pic = ET.SubElement(pic, f"{{{XDR_NS}}}nvPicPr")
-                c_nv_pr = ET.SubElement(nv_pic, f"{{{XDR_NS}}}cNvPr")
-                c_nv_pr.set("id", str(docpr_id))
-                c_nv_pr.set("name", f"Picture {docpr_id}")
-                ET.SubElement(nv_pic, f"{{{XDR_NS}}}cNvPicPr")
+                    rels_tree = state["rels_tree"]
+                    rels_root_drawing = rels_tree.getroot()
+                    img_rid = _xlsx_next_rel_id(rels_root_drawing)
+                    rel = ET.SubElement(rels_root_drawing, f"{{{REL_NS}}}Relationship")
+                    rel.set("Id", img_rid)
+                    rel.set("Type", f"{R_NS}/image")
+                    rel.set("Target", f"../media/{image_name}")
 
-                blip_fill = ET.SubElement(pic, f"{{{XDR_NS}}}blipFill")
-                blip = ET.SubElement(blip_fill, f"{{{A_NS}}}blip")
-                blip.set(f"{{{R_NS}}}embed", img_rid)
-                stretch = ET.SubElement(blip_fill, f"{{{A_NS}}}stretch")
-                ET.SubElement(stretch, f"{{{A_NS}}}fillRect")
+                    root = state["root"]
+                    state["max_id"] = int(state.get("max_id", 0)) + 1
+                    docpr_id = state["max_id"]
 
-                sp_pr = ET.SubElement(pic, f"{{{XDR_NS}}}spPr")
-                xfrm = ET.SubElement(sp_pr, f"{{{A_NS}}}xfrm")
-                off = ET.SubElement(xfrm, f"{{{A_NS}}}off")
-                off.set("x", "0")
-                off.set("y", "0")
-                ext = ET.SubElement(xfrm, f"{{{A_NS}}}ext")
-                ext.set("cx", str(cx))
-                ext.set("cy", str(cy))
-                prst = ET.SubElement(sp_pr, f"{{{A_NS}}}prstGeom")
-                prst.set("prst", "rect")
-                ET.SubElement(prst, f"{{{A_NS}}}avLst")
+                    anchor = ET.SubElement(root, f"{{{XDR_NS}}}oneCellAnchor")
+                    from_el = ET.SubElement(anchor, f"{{{XDR_NS}}}from")
+                    ET.SubElement(from_el, f"{{{XDR_NS}}}col").text = str(col_idx)
+                    ET.SubElement(from_el, f"{{{XDR_NS}}}colOff").text = "0"
+                    ET.SubElement(from_el, f"{{{XDR_NS}}}row").text = str(row_idx)
+                    ET.SubElement(from_el, f"{{{XDR_NS}}}rowOff").text = "0"
 
-                ET.SubElement(anchor, f"{{{XDR_NS}}}clientData")
+                    cx = max(1, int(round(img.size[0] * EMU_PER_PIXEL)))
+                    cy = max(1, int(round(img.size[1] * EMU_PER_PIXEL)))
+
+                    ET.SubElement(anchor, f"{{{XDR_NS}}}ext", {"cx": str(cx), "cy": str(cy)})
+                    pic = ET.SubElement(anchor, f"{{{XDR_NS}}}pic")
+                    nv_pic = ET.SubElement(pic, f"{{{XDR_NS}}}nvPicPr")
+                    c_nv_pr = ET.SubElement(nv_pic, f"{{{XDR_NS}}}cNvPr")
+                    c_nv_pr.set("id", str(docpr_id))
+                    c_nv_pr.set("name", f"Picture {docpr_id}")
+                    ET.SubElement(nv_pic, f"{{{XDR_NS}}}cNvPicPr")
+
+                    blip_fill = ET.SubElement(pic, f"{{{XDR_NS}}}blipFill")
+                    blip = ET.SubElement(blip_fill, f"{{{A_NS}}}blip")
+                    blip.set(f"{{{R_NS}}}embed", img_rid)
+                    stretch = ET.SubElement(blip_fill, f"{{{A_NS}}}stretch")
+                    ET.SubElement(stretch, f"{{{A_NS}}}fillRect")
+
+                    sp_pr = ET.SubElement(pic, f"{{{XDR_NS}}}spPr")
+                    xfrm = ET.SubElement(sp_pr, f"{{{A_NS}}}xfrm")
+                    off = ET.SubElement(xfrm, f"{{{A_NS}}}off")
+                    off.set("x", "0")
+                    off.set("y", "0")
+                    ext = ET.SubElement(xfrm, f"{{{A_NS}}}ext")
+                    ext.set("cx", str(cx))
+                    ext.set("cy", str(cy))
+                    prst = ET.SubElement(sp_pr, f"{{{A_NS}}}prstGeom")
+                    prst.set("prst", "rect")
+                    ET.SubElement(prst, f"{{{A_NS}}}avLst")
+
+                    ET.SubElement(anchor, f"{{{XDR_NS}}}clientData")
 
             for sheet_file, tree in sheet_tree_cache.items():
                 path = os.path.join(tmpdir, "xl", "worksheets", sheet_file)
