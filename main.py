@@ -276,7 +276,13 @@ def _xml_write_tree(tree: ET.ElementTree, path: str, default_namespace: Optional
                 kwargs["default_namespace"] = default_namespace
             else:
                 kwargs["default_namespace"] = default_namespace
-    tree.write(path, **kwargs)
+    try:
+        tree.write(path, **kwargs)
+    except ValueError as exc:
+        if "non-qualified names" in str(exc) and kwargs.pop("default_namespace", None):
+            tree.write(path, **kwargs)
+        else:
+            raise
 
 def _word_set_text(node: LET._Element, text: str):
     run = node.getparent()
@@ -1022,6 +1028,8 @@ def xlsx_update_formula_caches(xlsx_path: str, formula_cells: List[Dict]):
         return
 
     computed: Dict[Tuple[str, str], Optional[str]] = {}
+    fallbacks: Dict[Tuple[str, str], Dict[str, Optional[str]]] = {}
+    needs_fallback_write = False
     sheet_names_by_index: List[str] = []
     try:
         # model.cells keys look like "Sheet!A1"; derive sheet list lazily
@@ -1045,6 +1053,15 @@ def xlsx_update_formula_caches(xlsx_path: str, formula_cells: List[Dict]):
             sheet_name = sheet_names_by_index[sheet_index]
         if not sheet_name:
             continue
+        key = (sheet_file, cell_ref)
+        original_value = info.get("original_value")
+        original_type = info.get("original_type")
+        fallbacks[key] = {
+            "value": original_value,
+            "type": original_type,
+        }
+        if original_value is not None:
+            needs_fallback_write = True
         address = f"{_xlsx_escape_sheet_name(sheet_name)}!{cell_ref}"
         try:
             value = evaluator.evaluate(address)
@@ -1055,9 +1072,9 @@ def xlsx_update_formula_caches(xlsx_path: str, formula_cells: List[Dict]):
         formatted = _format_formula_value(value)
         if formatted is None:
             continue
-        computed[(sheet_file, cell_ref)] = formatted
+        computed[key] = formatted
 
-    if not computed:
+    if not computed and not needs_fallback_write:
         return
 
     tmpdir = tempfile.mkdtemp()
@@ -1072,8 +1089,6 @@ def xlsx_update_formula_caches(xlsx_path: str, formula_cells: List[Dict]):
             if not sheet_file or not cell_ref:
                 continue
             key = (sheet_file, cell_ref)
-            if key not in computed:
-                continue
             sheet_path = os.path.join(tmpdir, "xl", "worksheets", sheet_file)
             if not os.path.exists(sheet_path):
                 continue
@@ -1085,13 +1100,26 @@ def xlsx_update_formula_caches(xlsx_path: str, formula_cells: List[Dict]):
             if cell is None:
                 continue
             v_node = cell.find("s:v", ns)
-            if v_node is None:
-                v_node = ET.SubElement(cell, f"{{{ns['s']}}}v")
-            v_node.text = computed[key]
-            if computed[key] in ("1", "0") and info.get("boolean", False):
-                cell.set("t", "b")
-            elif cell.get("t") == "str":
-                cell.attrib.pop("t")
+            if key in computed:
+                if v_node is None:
+                    v_node = ET.SubElement(cell, f"{{{ns['s']}}}v")
+                v_node.text = computed[key]
+                if computed[key] in ("1", "0") and info.get("boolean", False):
+                    cell.set("t", "b")
+                elif cell.get("t") == "str":
+                    cell.attrib.pop("t")
+            else:
+                fallback = fallbacks.get(key, {})
+                original_value = fallback.get("value")
+                original_type = fallback.get("type")
+                if original_value is not None:
+                    if v_node is None:
+                        v_node = ET.SubElement(cell, f"{{{ns['s']}}}v")
+                    v_node.text = original_value
+                    if original_type:
+                        cell.set("t", original_type)
+                    else:
+                        cell.attrib.pop("t", None)
         for sheet_file, tree in updated.items():
             sheet_path = os.path.join(tmpdir, "xl", "worksheets", sheet_file)
             tree.write(sheet_path, encoding="utf-8", xml_declaration=True)
@@ -1205,6 +1233,8 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                             "sheet_index": sheet_index,
                             "cell_ref": r_attr,
                             "boolean": (c.get("t") == "b"),
+                            "original_value": v_node.text if v_node is not None else None,
+                            "original_type": t_attr if t_attr is not None else None,
                         })
 
                     # 数式セルはキャッシュ値を削除し LibreOffice での再計算を確実化
