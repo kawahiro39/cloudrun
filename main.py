@@ -6,14 +6,33 @@ import tempfile
 import zipfile
 import shutil
 import subprocess
+import threading
 import xml.etree.ElementTree as ET
 from decimal import Decimal
 from lxml import etree as LET
 from jinja2 import Environment, DebugUndefined
 from typing import Dict, Tuple, List, Optional
 
-from fastapi import FastAPI, UploadFile, File, Form
+import requests
+from requests.adapters import HTTPAdapter
+
+from fastapi import FastAPI, UploadFile, File, Form, Header
 from fastapi.responses import JSONResponse
+
+DEFAULT_AUTH_API_BASE_URL = "https://auth-677366504119.asia-northeast1.run.app"
+
+_AUTH_SESSION_LOCAL = threading.local()
+
+
+def _get_auth_session() -> requests.Session:
+    session = getattr(_AUTH_SESSION_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=8, pool_maxsize=8)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        _AUTH_SESSION_LOCAL.session = session
+    return session
 
 app = FastAPI(title="Doc/Excel → PDF & JPEG API (stable)")
 
@@ -38,6 +57,41 @@ def run(cmd: List[str], cwd: Optional[str] = None):
 
 def ok(d): return JSONResponse(status_code=200, content=d)
 def err(m, status=400): return JSONResponse(status_code=status, content={"error": str(m)})
+
+
+def _auth_api_timeout() -> float:
+    try:
+        return float(os.environ.get("AUTH_API_TIMEOUT", "5"))
+    except ValueError:
+        return 5.0
+
+
+def validate_auth_id(auth_id: str) -> bool:
+    base_url = (os.environ.get("AUTH_API_BASE_URL") or DEFAULT_AUTH_API_BASE_URL or "").rstrip("/")
+    if not base_url:
+        raise RuntimeError("AUTH_API_BASE_URL is not configured")
+    if not auth_id:
+        return False
+
+    url = f"{base_url}/auth-ids/verify"
+    payload = {"auth_id": auth_id}
+    session = _get_auth_session()
+    try:
+        resp = session.post(url, json=payload, timeout=_auth_api_timeout())
+    except requests.RequestException as exc:
+        raise RuntimeError(f"auth_id validation request failed: {exc}")
+
+    if resp.status_code in {401, 404}:
+        return False
+    if resp.status_code >= 400:
+        raise RuntimeError(f"auth_id validation failed with status {resp.status_code}")
+
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        raise RuntimeError("auth_id validation returned invalid JSON") from exc
+
+    return bool(data.get("is_valid"))
 
 # ------------ tag & number parsing ------------
 VAR_NAME = r"[A-Za-z_][A-Za-z0-9_]*"
@@ -176,7 +230,11 @@ WP_NS = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
 A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
 PIC_NS = "http://schemas.openxmlformats.org/drawingml/2006/picture"
 XML_NS = "http://www.w3.org/XML/1998/namespace"
+XMLNS_NS = "http://www.w3.org/2000/xmlns/"
 EMU_PER_INCH = 914400
+XDR_NS = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
+EMU_PER_PIXEL = 9525
+CELL_REF_RE = re.compile(r"^([A-Za-z]+)(\d+)$")
 
 def _word_set_text(node: LET._Element, text: str):
     run = node.getparent()
@@ -562,7 +620,6 @@ def _word_postprocess_docx(docx_path: str, text_map: Dict[str, str], assets: Dic
 def docx_render(in_docx: str, out_docx: str, text_map: Dict[str, str], image_map: Dict[str, Dict]):
     from docxtpl import DocxTemplate, InlineImage
     from docx.shared import Mm
-    import requests
 
     tmp = in_docx + ".jinja.docx"
     size_hints = docx_convert_tags_to_jinja(in_docx, tmp)
@@ -588,6 +645,129 @@ def docx_render(in_docx: str, out_docx: str, text_map: Dict[str, str], image_map
     _word_postprocess_docx(out_docx, text_map, assets)
 
 # ------------ Excel (.xlsx) ------------
+def _xlsx_cell_to_coords(cell_ref: str) -> Tuple[Optional[int], Optional[int]]:
+    m = CELL_REF_RE.match(cell_ref or "")
+    if not m:
+        return None, None
+    col_letters, row_str = m.groups()
+    col_idx = 0
+    for ch in col_letters.upper():
+        if not ('A' <= ch <= 'Z'):
+            return None, None
+        col_idx = col_idx * 26 + (ord(ch) - ord('A') + 1)
+    try:
+        row_idx = int(row_str)
+    except ValueError:
+        return None, None
+    return col_idx - 1, row_idx - 1
+
+
+def _xlsx_next_rel_id(root: ET.Element) -> str:
+    max_id = 0
+    for rel in root.findall(f"{{{REL_NS}}}Relationship"):
+        rid = rel.get("Id", "")
+        if rid.startswith("rId") and rid[3:].isdigit():
+            max_id = max(max_id, int(rid[3:]))
+    return f"rId{max_id + 1}"
+
+
+def _xlsx_max_docpr_id(root: ET.Element) -> int:
+    max_id = 0
+    for el in root.iter():
+        val = el.get("id")
+        if val and val.isdigit():
+            max_id = max(max_id, int(val))
+    return max_id
+
+
+def _xlsx_find_drawing_placeholders(drawings_dir: str, drawing_to_sheet: Dict[str, List[Dict[str, object]]]) -> List[Dict[str, object]]:
+    placements: List[Dict[str, object]] = []
+    if not os.path.isdir(drawings_dir):
+        return placements
+
+    ns = {"xdr": XDR_NS, "a": A_NS}
+
+    for drawing_name, sheet_infos in drawing_to_sheet.items():
+        path = os.path.join(drawings_dir, drawing_name)
+        if not os.path.exists(path):
+            continue
+        try:
+            tree = ET.parse(path)
+        except Exception:
+            continue
+
+        root = tree.getroot()
+        anchors = list(root)
+        if not anchors:
+            continue
+
+        sheet_info = sheet_infos[0] if sheet_infos else {}
+
+        for idx, anchor in enumerate(anchors):
+            if anchor.tag not in {
+                f"{{{XDR_NS}}}oneCellAnchor",
+                f"{{{XDR_NS}}}twoCellAnchor",
+                f"{{{XDR_NS}}}absoluteAnchor",
+            }:
+                continue
+
+            sp = anchor.find("xdr:sp", ns)
+            if sp is None:
+                continue
+
+            target_var = None
+            size_hint = None
+            for t_node in sp.findall(".//a:t", ns):
+                var, hint = parse_image_tag(t_node.text or "")
+                if var:
+                    target_var = var
+                    size_hint = hint
+                    break
+
+            if not target_var:
+                continue
+
+            c_nv_pr = sp.find("xdr:nvSpPr/xdr:cNvPr", ns)
+            docpr_id = c_nv_pr.get("id") if c_nv_pr is not None else None
+            shape_name = c_nv_pr.get("name") if c_nv_pr is not None else None
+
+            off_x = off_y = cx = cy = None
+            xfrm = sp.find("xdr:spPr/a:xfrm", ns)
+            if xfrm is not None:
+                off = xfrm.find("a:off", ns)
+                ext = xfrm.find("a:ext", ns)
+                if off is not None:
+                    off_x = off.get("x")
+                    off_y = off.get("y")
+                if ext is not None:
+                    cx = ext.get("cx")
+                    cy = ext.get("cy")
+
+            placements.append({
+                "source": "drawing",
+                "drawing_name": drawing_name,
+                "anchor_index": idx,
+                "var": target_var,
+                "size_hint": size_hint,
+                "sheet_file": sheet_info.get("sheet_file"),
+                "sheet_name": sheet_info.get("sheet_name"),
+                "sheet_index": sheet_info.get("sheet_index"),
+                "docpr_id": docpr_id,
+                "shape_name": shape_name,
+                "off_x": off_x,
+                "off_y": off_y,
+                "cx": cx,
+                "cy": cy,
+            })
+
+    return placements
+
+
+def _xlsx_ensure_dir(path: str):
+    if not os.path.isdir(path):
+        os.makedirs(path, exist_ok=True)
+
+
 def _xlsx_sheet_map(extracted_dir: str) -> Dict[str, Tuple[Optional[str], Optional[int]]]:
     mapping: Dict[str, Tuple[Optional[str], Optional[int]]] = {}
     workbook_xml = os.path.join(extracted_dir, "xl", "workbook.xml")
@@ -742,13 +922,14 @@ def xlsx_update_formula_caches(xlsx_path: str, formula_cells: List[Dict]):
 def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str], image_map: Dict[str, Dict]):
     """
     1) XML直編集で {var} を置換（完全一致は数値化、<br>→\n）、{[img]} はセルから除去し placements に記録
-    2) fullCalcOnLoad=1 で再計算
-    3) openpyxl で placements に新規画像挿入（既存図形/グラフは原則維持）
+    2) drawing XML を直接編集して placements に新規画像挿入（既存図形/グラフは維持）
+    3) fullCalcOnLoad=1 で再計算
     """
     ns = {"s": S_NS}
     tmpdir = tempfile.mkdtemp()
     placements: List[Dict[str, object]] = []
     formula_cells: List[Dict[str, object]] = []
+    sheet_drawings: Dict[str, List[Dict[str, object]]] = {}
     try:
         with zipfile.ZipFile(src_xlsx, 'r') as zin:
             zin.extractall(tmpdir)
@@ -807,6 +988,24 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                 if sheet_index is None:
                     m = re.findall(r'\d+', fn)
                     sheet_index = int(m[0]) - 1 if m else 0
+
+                rels_path = os.path.join(tmpdir, "xl", "worksheets", "_rels", f"{fn}.rels")
+                if os.path.exists(rels_path):
+                    try:
+                        rels_tree = ET.parse(rels_path)
+                        rels_root = rels_tree.getroot()
+                        for rel in rels_root.findall(f"{{{REL_NS}}}Relationship"):
+                            if rel.get("Type") == f"{R_NS}/drawing":
+                                target = (rel.get("Target") or "").replace('\\', '/')
+                                drawing_name = os.path.basename(target)
+                                if drawing_name:
+                                    sheet_drawings.setdefault(drawing_name, []).append({
+                                        "sheet_file": fn,
+                                        "sheet_name": sheet_name,
+                                        "sheet_index": sheet_index,
+                                    })
+                    except Exception:
+                        pass
 
                 for c in root.findall(".//s:c", ns):
                     t_attr = c.get("t")
@@ -894,6 +1093,363 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
 
                 tree.write(p, encoding="utf-8", xml_declaration=True)
 
+        drawings_dir = os.path.join(tmpdir, "xl", "drawings")
+        if image_map:
+            drawing_placeholders = _xlsx_find_drawing_placeholders(drawings_dir, sheet_drawings)
+            if drawing_placeholders:
+                placements.extend(drawing_placeholders)
+
+        # 画像の配置
+        if placements and image_map:
+            from PIL import Image as PILImage
+
+            media_dir = os.path.join(tmpdir, "xl", "media")
+            drawings_dir = os.path.join(tmpdir, "xl", "drawings")
+            drawings_rels_dir = os.path.join(drawings_dir, "_rels")
+            _xlsx_ensure_dir(media_dir)
+            _xlsx_ensure_dir(drawings_dir)
+            _xlsx_ensure_dir(drawings_rels_dir)
+
+            existing_media = set(os.listdir(media_dir)) if os.path.isdir(media_dir) else set()
+            existing_drawings = set(os.listdir(drawings_dir)) if os.path.isdir(drawings_dir) else set()
+
+            sheet_tree_cache: Dict[str, ET.ElementTree] = {}
+            sheet_rels_cache: Dict[str, ET.ElementTree] = {}
+            drawing_cache: Dict[str, Dict[str, object]] = {}
+
+            def _ensure_sheet_tree(sheet_file: str) -> Optional[ET.ElementTree]:
+                tree = sheet_tree_cache.get(sheet_file)
+                if tree is not None:
+                    return tree
+                path = os.path.join(tmpdir, "xl", "worksheets", sheet_file)
+                if not os.path.exists(path):
+                    return None
+                tree = ET.parse(path)
+                sheet_tree_cache[sheet_file] = tree
+                return tree
+
+            def _ensure_sheet_rels(sheet_file: str) -> ET.ElementTree:
+                tree = sheet_rels_cache.get(sheet_file)
+                if tree is not None:
+                    return tree
+                rels_dir = os.path.join(tmpdir, "xl", "worksheets", "_rels")
+                _xlsx_ensure_dir(rels_dir)
+                path = os.path.join(rels_dir, f"{sheet_file}.rels")
+                if os.path.exists(path):
+                    tree = ET.parse(path)
+                else:
+                    root_rels = ET.Element(f"{{{REL_NS}}}Relationships")
+                    tree = ET.ElementTree(root_rels)
+                sheet_rels_cache[sheet_file] = tree
+                return tree
+
+            def _ensure_drawing_state(drawing_name: str) -> Optional[Dict[str, object]]:
+                state = drawing_cache.get(drawing_name)
+                if state is not None:
+                    return state
+                drawing_path = os.path.join(drawings_dir, drawing_name)
+                if os.path.exists(drawing_path):
+                    tree = ET.parse(drawing_path)
+                else:
+                    root = ET.Element(f"{{{XDR_NS}}}wsDr")
+                    root.set("xmlns:xdr", XDR_NS)
+                    root.set("xmlns:a", A_NS)
+                    root.set("xmlns:r", R_NS)
+                    tree = ET.ElementTree(root)
+                root = tree.getroot()
+                if root.get(f"{{{XMLNS_NS}}}r") is None and not any(
+                    attr.endswith("}r") for attr in root.attrib
+                ):
+                    root.set(f"{{{XMLNS_NS}}}r", R_NS)
+                drawing_rels_path = os.path.join(drawings_rels_dir, f"{drawing_name}.rels")
+                if os.path.exists(drawing_rels_path):
+                    rels_tree = ET.parse(drawing_rels_path)
+                else:
+                    rels_root = ET.Element(f"{{{REL_NS}}}Relationships")
+                    rels_tree = ET.ElementTree(rels_root)
+                state = {
+                    "tree": tree,
+                    "root": root,
+                    "path": drawing_path,
+                    "rels_tree": rels_tree,
+                    "rels_path": drawing_rels_path,
+                    "max_id": _xlsx_max_docpr_id(root),
+                }
+                drawing_cache[drawing_name] = state
+                return state
+
+            def _next_media_name() -> str:
+                idx = 1
+                while True:
+                    candidate = f"image{idx}.png"
+                    if candidate not in existing_media:
+                        existing_media.add(candidate)
+                        return candidate
+                    idx += 1
+
+            for item in placements:
+                var = item.get("var")
+                if not var:
+                    continue
+                meta = image_map.get(var)
+                if not meta:
+                    continue
+
+                source = item.get("source")
+                sheet_file = item.get("sheet_file")
+                cell_ref = item.get("cell_ref")
+                size_hint = item.get("size_hint")
+                drawing_name = item.get("drawing_name")
+
+                if source == "drawing":
+                    if not drawing_name:
+                        continue
+                else:
+                    if not sheet_file or not cell_ref:
+                        continue
+
+                url = meta.get("url")
+                if not url:
+                    continue
+                mm = meta.get("mm") or size_hint
+                try:
+                    resp = requests.get(url, timeout=20)
+                    resp.raise_for_status()
+                except Exception:
+                    continue
+                try:
+                    img = PILImage.open(io.BytesIO(resp.content)).convert("RGBA")
+                except Exception:
+                    continue
+                if mm:
+                    target_px = mm_to_pixels(mm, dpi=96)
+                    if target_px > 0 and img.size[0] > 0:
+                        new_height = int(round(img.size[1] * (target_px / img.size[0])))
+                        if new_height <= 0:
+                            new_height = 1
+                        img = img.resize((target_px, new_height), PILImage.LANCZOS)
+                if img.size[0] <= 0 or img.size[1] <= 0:
+                    continue
+                buffer = io.BytesIO()
+                img.save(buffer, format="PNG")
+                data = buffer.getvalue()
+                buffer.close()
+
+                if source == "drawing":
+                    state = _ensure_drawing_state(drawing_name)
+                    if not state:
+                        continue
+
+                    root = state["root"]
+                    anchors = list(root)
+                    anchor_index = item.get("anchor_index")
+                    if anchor_index is None or anchor_index >= len(anchors):
+                        continue
+                    anchor_el = anchors[anchor_index]
+                    sp_el = anchor_el.find(f"{{{XDR_NS}}}sp")
+                    if sp_el is None:
+                        continue
+
+                    current_max = int(state.get("max_id", 0))
+                    docpr_id_val = item.get("docpr_id")
+                    try:
+                        docpr_int = int(docpr_id_val)
+                    except (TypeError, ValueError):
+                        docpr_int = None
+                    if docpr_int is None:
+                        docpr_int = current_max + 1
+                    state["max_id"] = max(current_max, docpr_int)
+
+                    shape_name = item.get("shape_name") or f"Picture {docpr_int}"
+
+                    insert_pos = None
+                    for child_idx, child in enumerate(list(anchor_el)):
+                        if child.tag == f"{{{XDR_NS}}}sp":
+                            insert_pos = child_idx
+                            anchor_el.remove(child)
+                            break
+
+                    image_name = _next_media_name()
+                    with open(os.path.join(media_dir, image_name), "wb") as f:
+                        f.write(data)
+
+                    rels_tree = state["rels_tree"]
+                    rels_root_drawing = rels_tree.getroot()
+                    img_rid = _xlsx_next_rel_id(rels_root_drawing)
+                    rel = ET.SubElement(rels_root_drawing, f"{{{REL_NS}}}Relationship")
+                    rel.set("Id", img_rid)
+                    rel.set("Type", f"{R_NS}/image")
+                    rel.set("Target", f"../media/{image_name}")
+
+                    pic = ET.Element(f"{{{XDR_NS}}}pic")
+                    nv_pic = ET.SubElement(pic, f"{{{XDR_NS}}}nvPicPr")
+                    c_nv_pr = ET.SubElement(nv_pic, f"{{{XDR_NS}}}cNvPr")
+                    c_nv_pr.set("id", str(docpr_int))
+                    c_nv_pr.set("name", shape_name)
+                    ET.SubElement(nv_pic, f"{{{XDR_NS}}}cNvPicPr")
+
+                    blip_fill = ET.SubElement(pic, f"{{{XDR_NS}}}blipFill")
+                    blip = ET.SubElement(blip_fill, f"{{{A_NS}}}blip")
+                    blip.set(f"{{{R_NS}}}embed", img_rid)
+                    stretch = ET.SubElement(blip_fill, f"{{{A_NS}}}stretch")
+                    ET.SubElement(stretch, f"{{{A_NS}}}fillRect")
+
+                    sp_pr = ET.SubElement(pic, f"{{{XDR_NS}}}spPr")
+                    xfrm = ET.SubElement(sp_pr, f"{{{A_NS}}}xfrm")
+                    off = ET.SubElement(xfrm, f"{{{A_NS}}}off")
+                    off.set("x", item.get("off_x") or "0")
+                    off.set("y", item.get("off_y") or "0")
+
+                    if mm:
+                        cx_val = max(1, int(round(img.size[0] * EMU_PER_PIXEL)))
+                        cy_val = max(1, int(round(img.size[1] * EMU_PER_PIXEL)))
+                    else:
+                        cx_val = cy_val = None
+                        try:
+                            if item.get("cx"):
+                                cx_val = max(1, int(item.get("cx")))
+                            if item.get("cy"):
+                                cy_val = max(1, int(item.get("cy")))
+                        except (TypeError, ValueError):
+                            cx_val = cy_val = None
+                        if cx_val is None or cy_val is None:
+                            cx_val = max(1, int(round(img.size[0] * EMU_PER_PIXEL)))
+                            cy_val = max(1, int(round(img.size[1] * EMU_PER_PIXEL)))
+
+                    ext = ET.SubElement(xfrm, f"{{{A_NS}}}ext")
+                    ext.set("cx", str(cx_val))
+                    ext.set("cy", str(cy_val))
+                    prst = ET.SubElement(sp_pr, f"{{{A_NS}}}prstGeom")
+                    prst.set("prst", "rect")
+                    ET.SubElement(prst, f"{{{A_NS}}}avLst")
+
+                    if insert_pos is None:
+                        anchor_el.append(pic)
+                    else:
+                        anchor_el.insert(insert_pos, pic)
+                else:
+                    col_idx, row_idx = _xlsx_cell_to_coords(cell_ref)
+                    if col_idx is None or row_idx is None:
+                        continue
+
+                    sheet_tree = _ensure_sheet_tree(sheet_file)
+                    if sheet_tree is None:
+                        continue
+                    sheet_root = sheet_tree.getroot()
+                    if sheet_root.get(f"{{{XMLNS_NS}}}r") is None and not any(
+                        attr.endswith("}r") for attr in sheet_root.attrib
+                    ):
+                        sheet_root.set(f"{{{XMLNS_NS}}}r", R_NS)
+
+                    sheet_rels_tree = _ensure_sheet_rels(sheet_file)
+                    rels_root = sheet_rels_tree.getroot()
+
+                    drawing_rel = None
+                    for rel in rels_root.findall(f"{{{REL_NS}}}Relationship"):
+                        if rel.get("Type") == f"{R_NS}/drawing":
+                            drawing_rel = rel
+                            break
+
+                    target_drawing_name = None
+                    drawing_rel_id = None
+                    if drawing_rel is None:
+                        drawing_rel_id = _xlsx_next_rel_id(rels_root)
+                        next_idx = 1
+                        while True:
+                            candidate = f"drawing{next_idx}.xml"
+                            if candidate not in existing_drawings:
+                                target_drawing_name = candidate
+                                existing_drawings.add(candidate)
+                                break
+                            next_idx += 1
+                        drawing_rel = ET.SubElement(rels_root, f"{{{REL_NS}}}Relationship")
+                        drawing_rel.set("Id", drawing_rel_id)
+                        drawing_rel.set("Type", f"{R_NS}/drawing")
+                        drawing_rel.set("Target", f"../drawings/{target_drawing_name}")
+                        drawing_el = ET.SubElement(sheet_root, f"{{{S_NS}}}drawing")
+                        drawing_el.set(f"{{{R_NS}}}id", drawing_rel_id)
+                    else:
+                        target_drawing_name = os.path.basename(drawing_rel.get("Target", ""))
+                        drawing_rel_id = drawing_rel.get("Id")
+
+                    if not target_drawing_name:
+                        continue
+
+                    state = _ensure_drawing_state(target_drawing_name)
+                    if not state:
+                        continue
+
+                    image_name = _next_media_name()
+                    with open(os.path.join(media_dir, image_name), "wb") as f:
+                        f.write(data)
+
+                    rels_tree = state["rels_tree"]
+                    rels_root_drawing = rels_tree.getroot()
+                    img_rid = _xlsx_next_rel_id(rels_root_drawing)
+                    rel = ET.SubElement(rels_root_drawing, f"{{{REL_NS}}}Relationship")
+                    rel.set("Id", img_rid)
+                    rel.set("Type", f"{R_NS}/image")
+                    rel.set("Target", f"../media/{image_name}")
+
+                    root = state["root"]
+                    state["max_id"] = int(state.get("max_id", 0)) + 1
+                    docpr_id = state["max_id"]
+
+                    anchor = ET.SubElement(root, f"{{{XDR_NS}}}oneCellAnchor")
+                    from_el = ET.SubElement(anchor, f"{{{XDR_NS}}}from")
+                    ET.SubElement(from_el, f"{{{XDR_NS}}}col").text = str(col_idx)
+                    ET.SubElement(from_el, f"{{{XDR_NS}}}colOff").text = "0"
+                    ET.SubElement(from_el, f"{{{XDR_NS}}}row").text = str(row_idx)
+                    ET.SubElement(from_el, f"{{{XDR_NS}}}rowOff").text = "0"
+
+                    cx = max(1, int(round(img.size[0] * EMU_PER_PIXEL)))
+                    cy = max(1, int(round(img.size[1] * EMU_PER_PIXEL)))
+
+                    ET.SubElement(anchor, f"{{{XDR_NS}}}ext", {"cx": str(cx), "cy": str(cy)})
+                    pic = ET.SubElement(anchor, f"{{{XDR_NS}}}pic")
+                    nv_pic = ET.SubElement(pic, f"{{{XDR_NS}}}nvPicPr")
+                    c_nv_pr = ET.SubElement(nv_pic, f"{{{XDR_NS}}}cNvPr")
+                    c_nv_pr.set("id", str(docpr_id))
+                    c_nv_pr.set("name", f"Picture {docpr_id}")
+                    ET.SubElement(nv_pic, f"{{{XDR_NS}}}cNvPicPr")
+
+                    blip_fill = ET.SubElement(pic, f"{{{XDR_NS}}}blipFill")
+                    blip = ET.SubElement(blip_fill, f"{{{A_NS}}}blip")
+                    blip.set(f"{{{R_NS}}}embed", img_rid)
+                    stretch = ET.SubElement(blip_fill, f"{{{A_NS}}}stretch")
+                    ET.SubElement(stretch, f"{{{A_NS}}}fillRect")
+
+                    sp_pr = ET.SubElement(pic, f"{{{XDR_NS}}}spPr")
+                    xfrm = ET.SubElement(sp_pr, f"{{{A_NS}}}xfrm")
+                    off = ET.SubElement(xfrm, f"{{{A_NS}}}off")
+                    off.set("x", "0")
+                    off.set("y", "0")
+                    ext = ET.SubElement(xfrm, f"{{{A_NS}}}ext")
+                    ext.set("cx", str(cx))
+                    ext.set("cy", str(cy))
+                    prst = ET.SubElement(sp_pr, f"{{{A_NS}}}prstGeom")
+                    prst.set("prst", "rect")
+                    ET.SubElement(prst, f"{{{A_NS}}}avLst")
+
+                    ET.SubElement(anchor, f"{{{XDR_NS}}}clientData")
+
+            for sheet_file, tree in sheet_tree_cache.items():
+                path = os.path.join(tmpdir, "xl", "worksheets", sheet_file)
+                tree.write(path, encoding="utf-8", xml_declaration=True)
+            for sheet_file, tree in sheet_rels_cache.items():
+                rels_dir = os.path.join(tmpdir, "xl", "worksheets", "_rels")
+                _xlsx_ensure_dir(rels_dir)
+                path = os.path.join(rels_dir, f"{sheet_file}.rels")
+                tree.write(path, encoding="utf-8", xml_declaration=True)
+            for drawing_name, state in drawing_cache.items():
+                tree = state["tree"]
+                rels_tree = state["rels_tree"]
+                path = state["path"]
+                rels_path = state["rels_path"]
+                tree.write(path, encoding="utf-8", xml_declaration=True)
+                _xlsx_ensure_dir(os.path.dirname(rels_path))
+                rels_tree.write(rels_path, encoding="utf-8", xml_declaration=True)
+
         # 再計算フラグ
         xlsx_force_full_recalc(tmpdir)
 
@@ -905,43 +1461,6 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                     zout.write(full, os.path.relpath(full, tmpdir))
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
-
-    # openpyxl で画像を追加（既存図形・グラフは通常維持）
-    if placements and image_map:
-        from openpyxl import load_workbook
-        from openpyxl.drawing.image import Image as XLImage
-        from PIL import Image as PILImage
-        import requests
-
-        wb = load_workbook(dst_xlsx)
-        for item in placements:
-            sheet_file = item.get("sheet_file")
-            cell_ref = item.get("cell_ref")
-            var = item.get("var")
-            size_hint = item.get("size_hint")
-            sheet_index = item.get("sheet_index") or 0
-            sheet_name = item.get("sheet_name")
-            meta = image_map.get(var)
-            if not meta: continue
-            url = meta["url"]
-            mm = meta.get("mm") or size_hint
-            r = requests.get(url, timeout=20); r.raise_for_status()
-            img = PILImage.open(io.BytesIO(r.content)).convert("RGBA")
-            if mm:
-                px = mm_to_pixels(mm, dpi=96)
-                w, h = img.size
-                new_h = int(round(h * (px / w))) if w else h
-                img = img.resize((px, new_h), PILImage.LANCZOS)
-            bio = io.BytesIO(); img.save(bio, format="PNG"); bio.seek(0)
-            ws = None
-            if sheet_name and sheet_name in wb:
-                ws = wb[sheet_name]
-            elif isinstance(sheet_index, int) and 0 <= sheet_index < len(wb.worksheets):
-                ws = wb.worksheets[sheet_index]
-            if ws is None:
-                ws = wb.active
-            ws.add_image(XLImage(bio), cell_ref)
-        wb.save(dst_xlsx)
 
     xlsx_update_formula_caches(dst_xlsx, formula_cells)
 
@@ -993,10 +1512,24 @@ async def merge(
     filename: str = Form("document"),
     jpeg_dpi: int = Form(150),
     jpeg_pages: str = Form("1"),
+    x_auth_id: Optional[str] = Header(None, alias="X-Auth-Id"),
+    authorization: Optional[str] = Header(None),
 ):
     from pypdf import PdfReader  # lazy import
 
     try:
+        auth_id = x_auth_id or ""
+        if not auth_id and authorization:
+            auth_id = authorization.strip()
+            if auth_id.lower().startswith("bearer "):
+                auth_id = auth_id[7:].strip()
+
+        if not auth_id:
+            return err("missing auth_id", status=401)
+
+        if not validate_auth_id(auth_id):
+            return err("invalid auth_id", status=401)
+
         ext = file_ext_lower(file.filename or "")
         if ext not in [".docx", ".xlsx"]:
             return err("file must be .docx or .xlsx", 400)
@@ -1017,15 +1550,16 @@ async def merge(
             pdf_path = libreoffice_to_pdf(rendered, pdf_dir)
 
             with open(pdf_path, "rb") as f:
-                total_pages = len(PdfReader(f).pages)
+                pdf_bytes = f.read()
+
+            total_pages = len(PdfReader(io.BytesIO(pdf_bytes)).pages)
 
             selected = parse_pages_arg(jpeg_pages, total_pages)
             jpgs = pdf_to_jpegs(pdf_path, jpeg_dpi, selected)
 
-            pdf_b = open(pdf_path, "rb").read()
             return ok({
                 "file_name": (filename or "document").strip().rstrip(".") + ".pdf",
-                "pdf_data_uri": data_uri("application/pdf", pdf_b),
+                "pdf_data_uri": data_uri("application/pdf", pdf_bytes),
                 "jpeg_dpi": jpeg_dpi,
                 "jpeg_pages": selected,
                 "jpeg_data_uris": [{"page": p, "data_uri": data_uri("image/jpeg", b)} for p, b in jpgs],
