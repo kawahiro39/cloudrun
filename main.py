@@ -1451,6 +1451,7 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                         drawing_el = ET.SubElement(sheet_root, f"{{{S_NS}}}drawing")
                         drawing_el.set(f"{{{R_NS}}}id", drawing_rel_id)
                         new_drawing_files.add(target_drawing_name)
+
                     else:
                         target_drawing_name = os.path.basename(drawing_rel.get("Target", ""))
                         drawing_rel_id = drawing_rel.get("Id")
@@ -1517,6 +1518,7 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                     ext.set("cx", str(cx))
                     ext.set("cy", str(cy))
                     _xlsx_set_anchor_size(anchor, cx, cy)
+
                     prst = ET.SubElement(sp_pr, f"{{{A_NS}}}prstGeom")
                     prst.set("prst", "rect")
                     ET.SubElement(prst, f"{{{A_NS}}}avLst")
