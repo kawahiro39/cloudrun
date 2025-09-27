@@ -13,12 +13,14 @@ import xml.etree.ElementTree as ET
 from decimal import Decimal
 from lxml import etree as LET
 from jinja2 import Environment, DebugUndefined
-from typing import Dict, Tuple, List, Optional, Set
+from typing import Any, Dict, Tuple, List, Optional, Set, Mapping
 import urllib.parse
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+from dataclasses import dataclass
 
 from fastapi import FastAPI, UploadFile, File, Form, Header
 from fastapi.responses import JSONResponse
@@ -112,7 +114,13 @@ def run(cmd: List[str], cwd: Optional[str] = None):
     return proc
 
 def ok(d): return JSONResponse(status_code=200, content=d)
-def err(m, status=400): return JSONResponse(status_code=status, content={"error": str(m)})
+def err(message, status=400):
+    if isinstance(message, Mapping):
+        payload = dict(message)
+        if "error" not in payload:
+            payload["error"] = str(payload.get("message", "")) or "Unknown error"
+        return JSONResponse(status_code=status, content=payload)
+    return JSONResponse(status_code=status, content={"error": str(message)})
 
 
 def _auth_api_timeout() -> float:
@@ -123,7 +131,12 @@ def _auth_api_timeout() -> float:
 
 
 def _auth_soft_fail_enabled() -> bool:
-    return (os.environ.get("AUTH_ALLOW_ON_UNAVAILABLE", "true").lower() in {"1", "true", "yes", "on"})
+    return os.environ.get("AUTH_ALLOW_ON_UNAVAILABLE", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _generic_http_timeout() -> float:
@@ -190,6 +203,65 @@ def validate_auth_id(auth_id: str) -> bool:
                     except StopIteration:
                         pass
     return result
+
+
+def _auth_enforcement_mode() -> str:
+    mode = os.environ.get("AUTH_MODE", "disabled").strip().lower()
+    if mode not in {"disabled", "optional", "required"}:
+        return "disabled"
+    return mode
+
+
+def _extract_auth_id(x_auth_id: Optional[str], authorization: Optional[str]) -> str:
+    auth_id = (x_auth_id or "").strip()
+    if auth_id:
+        return auth_id
+    token = (authorization or "").strip()
+    if not token:
+        return ""
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    return token
+
+
+@dataclass
+class AuthDecision:
+    allowed: bool
+    status: int = 200
+    message: str = ""
+    warning: Optional[str] = None
+    auth_id: str = ""
+
+
+def _authorize_request(x_auth_id: Optional[str], authorization: Optional[str]) -> AuthDecision:
+    mode = _auth_enforcement_mode()
+    if mode == "disabled":
+        return AuthDecision(True, auth_id="")
+
+    auth_id = _extract_auth_id(x_auth_id, authorization)
+    if not auth_id:
+        if mode == "required":
+            return AuthDecision(False, status=401, message="missing auth_id")
+        return AuthDecision(True, warning="auth_id not supplied", auth_id="")
+
+    try:
+        is_valid = validate_auth_id(auth_id)
+    except AuthServiceUnavailable as exc:
+        if _auth_soft_fail_enabled():
+            return AuthDecision(True, warning=str(exc), auth_id=auth_id)
+        return AuthDecision(False, status=503, message=str(exc))
+    except Exception as exc:  # pragma: no cover - defensive catch
+        if mode == "required":
+            return AuthDecision(False, status=500, message=str(exc))
+        return AuthDecision(True, warning=str(exc), auth_id=auth_id)
+
+    if not is_valid:
+        if mode == "required":
+            return AuthDecision(False, status=401, message="invalid auth_id")
+        return AuthDecision(True, warning="auth_id validation failed", auth_id=auth_id)
+
+    return AuthDecision(True, auth_id=auth_id)
+
 
 # ------------ tag & number parsing ------------
 VAR_NAME = r"[A-Za-z_][A-Za-z0-9_]*"
@@ -2376,24 +2448,10 @@ async def merge(
     from pypdf import PdfReader  # lazy import
 
     try:
-        auth_id = x_auth_id or ""
-        if not auth_id and authorization:
-            auth_id = authorization.strip()
-            if auth_id.lower().startswith("bearer "):
-                auth_id = auth_id[7:].strip()
-
-        if not auth_id:
-            return err("missing auth_id", status=401)
-
-        auth_warning: Optional[str] = None
-        try:
-            if not validate_auth_id(auth_id):
-                return err("invalid auth_id", status=401)
-        except AuthServiceUnavailable as exc:
-            if _auth_soft_fail_enabled():
-                auth_warning = str(exc)
-            else:
-                return err(str(exc), status=503)
+        auth_decision = _authorize_request(x_auth_id, authorization)
+        if not auth_decision.allowed:
+            message = auth_decision.message or "authorization failed"
+            return err(message, status=auth_decision.status)
 
         template_bytes: Optional[bytes] = None
         ext = ""
@@ -2489,8 +2547,8 @@ async def merge(
             if not response:
                 response["message"] = "No outputs requested"
 
-            if auth_warning:
-                response.setdefault("warnings", []).append(auth_warning)
+            if auth_decision.warning:
+                response.setdefault("diagnostics", {})["auth_warning"] = auth_decision.warning
 
             return ok(response)
     except Exception as e:
