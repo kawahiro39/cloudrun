@@ -8,7 +8,6 @@ import zipfile
 import shutil
 import subprocess
 import threading
-import time
 import xml.etree.ElementTree as ET
 from decimal import Decimal
 from lxml import etree as LET
@@ -25,17 +24,7 @@ from dataclasses import dataclass
 from fastapi import FastAPI, UploadFile, File, Form, Header
 from fastapi.responses import JSONResponse
 
-DEFAULT_AUTH_API_BASE_URL = "https://auth-677366504119.asia-northeast1.run.app"
-
-_AUTH_SESSION_LOCAL = threading.local()
-_AUTH_CACHE_LOCK = threading.Lock()
-_AUTH_CACHE: Dict[str, Tuple[float, bool]] = {}
 _GENERIC_HTTP_SESSION_LOCAL = threading.local()
-
-
-class AuthServiceUnavailable(RuntimeError):
-    """Raised when the external auth validation service is unavailable."""
-
 
 def _build_retry(
     total: int,
@@ -60,21 +49,6 @@ def _configure_session(session: requests.Session, retry: Retry) -> requests.Sess
     adapter = HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=retry)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
-    return session
-
-
-def _get_auth_session() -> requests.Session:
-    session = getattr(_AUTH_SESSION_LOCAL, "session", None)
-    if session is None:
-        retry = _build_retry(
-            total=int(os.environ.get("AUTH_API_RETRIES", "3")),
-            connect=int(os.environ.get("AUTH_API_RETRIES_CONNECT", "3")),
-            read=int(os.environ.get("AUTH_API_RETRIES_READ", "3")),
-            status=int(os.environ.get("AUTH_API_RETRIES_STATUS", "3")),
-            backoff_factor=float(os.environ.get("AUTH_API_RETRY_BACKOFF", "0.5")),
-        )
-        session = _configure_session(requests.Session(), retry)
-        _AUTH_SESSION_LOCAL.session = session
     return session
 
 
@@ -2442,8 +2416,6 @@ async def merge(
     return_document: bool = Form(True),
     file_data_uri: str = Form(""),
     file_url: str = Form(""),
-    x_auth_id: Optional[str] = Header(None, alias="X-Auth-Id"),
-    authorization: Optional[str] = Header(None),
 ):
     from pypdf import PdfReader  # lazy import
 
