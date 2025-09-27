@@ -1077,11 +1077,18 @@ def _xlsx_clear_cell_value(cell: ET.Element):
         del cell.attrib["t"]
 
 
-def _xlsx_cell_has_group_token(text: str, group: str) -> bool:
+def _xlsx_find_loop_group_in_text(text: str) -> Optional[str]:
     if not text:
+        return None
+    match = re.search(rf"\{{\s*(?P<group>{VAR_NAME})\s*:\s*loop\s*\}}", text)
+    return match.group("group") if match else None
+
+
+def _xlsx_cell_has_group_token(text: str, group: str) -> bool:
+    if not text or not group:
         return False
-    marker = f"{{{group}:"
-    return marker in text
+    pattern = rf"\{{\s*{re.escape(group)}\s*:"
+    return re.search(pattern, text) is not None
 
 
 def _xlsx_apply_loop_text(
@@ -1139,12 +1146,10 @@ def _xlsx_expand_loops(
             text = (_xlsx_cell_text(cell, ns, shared_strings) or "").strip()
             if not text:
                 continue
-            if text.startswith("{") and text.endswith("}"):
-                expr = text[1:-1].strip()
-                parts = [p.strip() for p in expr.split(":") if p.strip()]
-                if len(parts) >= 2 and parts[1] == "loop":
-                    group = parts[0]
-                    break
+            detected_group = _xlsx_find_loop_group_in_text(text)
+            if detected_group:
+                group = detected_group
+                break
         if not group:
             idx += 1
             continue
