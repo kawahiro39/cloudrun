@@ -1204,6 +1204,7 @@ def _xlsx_expand_loops(
             for entry_idx, entry in enumerate(entries):
                 for tmpl in template_bases:
                     clone = copy.deepcopy(tmpl)
+                    cells_to_remove: List[ET.Element] = []
                     for cell in clone.findall("s:c", ns):
                         original_text = _xlsx_cell_text(cell, ns, shared_strings)
                         if original_text is None:
@@ -1211,7 +1212,7 @@ def _xlsx_expand_loops(
                         has_group_token = _xlsx_cell_has_group_token(original_text, group)
                         replaced = _xlsx_apply_loop_text(original_text, group, entry, text_map)
                         if entry_idx > 0 and not has_group_token:
-                            _xlsx_clear_cell_value(cell)
+                            cells_to_remove.append(cell)
                             continue
                         if (
                             replaced != original_text
@@ -1219,8 +1220,11 @@ def _xlsx_expand_loops(
                             or "#end" in original_text
                         ):
                             _xlsx_set_inline_text(cell, ns, replaced)
-                    sheet_data.insert(insert_pos, clone)
-                    insert_pos += 1
+                    for cell in cells_to_remove:
+                        clone.remove(cell)
+                    if clone.findall("s:c", ns):
+                        sheet_data.insert(insert_pos, clone)
+                        insert_pos += 1
         rows = list(sheet_data.findall("s:row", ns))
         idx = insert_pos if entries else idx
 
