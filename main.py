@@ -1,7 +1,6 @@
 import os
 import re
 import io
-import copy
 import base64
 import binascii
 import tempfile
@@ -9,6 +8,7 @@ import zipfile
 import shutil
 import subprocess
 import threading
+import time
 import xml.etree.ElementTree as ET
 from decimal import Decimal
 from lxml import etree as LET
@@ -26,30 +26,68 @@ from fastapi.responses import JSONResponse
 DEFAULT_AUTH_API_BASE_URL = "https://auth-677366504119.asia-northeast1.run.app"
 
 _AUTH_SESSION_LOCAL = threading.local()
+_AUTH_CACHE_LOCK = threading.Lock()
+_AUTH_CACHE: Dict[str, Tuple[float, bool]] = {}
+_GENERIC_HTTP_SESSION_LOCAL = threading.local()
 
 
 class AuthServiceUnavailable(RuntimeError):
     """Raised when the external auth validation service is unavailable."""
 
 
+def _build_retry(
+    total: int,
+    connect: int,
+    read: int,
+    status: int,
+    backoff_factor: float,
+) -> Retry:
+    return Retry(
+        total=total,
+        connect=connect,
+        read=read,
+        status=status,
+        backoff_factor=backoff_factor,
+        status_forcelist={429, 500, 502, 503, 504},
+        allowed_methods={"GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS"},
+        raise_on_status=False,
+    )
+
+
+def _configure_session(session: requests.Session, retry: Retry) -> requests.Session:
+    adapter = HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
 def _get_auth_session() -> requests.Session:
     session = getattr(_AUTH_SESSION_LOCAL, "session", None)
     if session is None:
-        session = requests.Session()
-        retry = Retry(
+        retry = _build_retry(
             total=int(os.environ.get("AUTH_API_RETRIES", "3")),
             connect=int(os.environ.get("AUTH_API_RETRIES_CONNECT", "3")),
             read=int(os.environ.get("AUTH_API_RETRIES_READ", "3")),
             status=int(os.environ.get("AUTH_API_RETRIES_STATUS", "3")),
             backoff_factor=float(os.environ.get("AUTH_API_RETRY_BACKOFF", "0.5")),
-            status_forcelist={429, 500, 502, 503, 504},
-            allowed_methods={"GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS"},
-            raise_on_status=False,
         )
-        adapter = HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=retry)
-        session.mount("https://", adapter)
-        session.mount("http://", adapter)
+        session = _configure_session(requests.Session(), retry)
         _AUTH_SESSION_LOCAL.session = session
+    return session
+
+
+def _get_generic_http_session() -> requests.Session:
+    session = getattr(_GENERIC_HTTP_SESSION_LOCAL, "session", None)
+    if session is None:
+        retry = _build_retry(
+            total=int(os.environ.get("HTTP_RETRIES_TOTAL", "2")),
+            connect=int(os.environ.get("HTTP_RETRIES_CONNECT", "2")),
+            read=int(os.environ.get("HTTP_RETRIES_READ", "2")),
+            status=int(os.environ.get("HTTP_RETRIES_STATUS", "2")),
+            backoff_factor=float(os.environ.get("HTTP_RETRY_BACKOFF", "0.3")),
+        )
+        session = _configure_session(requests.Session(), retry)
+        _GENERIC_HTTP_SESSION_LOCAL.session = session
     return session
 
 app = FastAPI(title="Doc/Excel → PDF & JPEG API (stable)")
@@ -88,12 +126,30 @@ def _auth_soft_fail_enabled() -> bool:
     return (os.environ.get("AUTH_ALLOW_ON_UNAVAILABLE", "true").lower() in {"1", "true", "yes", "on"})
 
 
+def _generic_http_timeout() -> float:
+    try:
+        return float(os.environ.get("HTTP_REQUEST_TIMEOUT", "20"))
+    except ValueError:
+        return 20.0
+
+
 def validate_auth_id(auth_id: str) -> bool:
     base_url = (os.environ.get("AUTH_API_BASE_URL") or DEFAULT_AUTH_API_BASE_URL or "").rstrip("/")
     if not base_url:
         raise RuntimeError("AUTH_API_BASE_URL is not configured")
     if not auth_id:
         return False
+
+    try:
+        cache_ttl = max(float(os.environ.get("AUTH_API_CACHE_TTL", "30")), 0.0)
+    except ValueError:
+        cache_ttl = 30.0
+    if cache_ttl:
+        now = time.monotonic()
+        with _AUTH_CACHE_LOCK:
+            cached = _AUTH_CACHE.get(auth_id)
+            if cached and cached[0] >= now:
+                return cached[1]
 
     url = f"{base_url}/auth-ids/verify"
     payload = {"auth_id": auth_id}
@@ -117,7 +173,23 @@ def validate_auth_id(auth_id: str) -> bool:
     except ValueError as exc:
         raise RuntimeError("auth_id validation returned invalid JSON") from exc
 
-    return bool(data.get("is_valid"))
+    result = bool(data.get("is_valid"))
+    if cache_ttl:
+        expires_at = time.monotonic() + cache_ttl
+        with _AUTH_CACHE_LOCK:
+            _AUTH_CACHE[auth_id] = (expires_at, result)
+            if len(_AUTH_CACHE) > 1024:
+                cutoff = time.monotonic()
+                stale = [k for k, (expiry, _) in _AUTH_CACHE.items() if expiry < cutoff]
+                for key in stale:
+                    _AUTH_CACHE.pop(key, None)
+                if len(_AUTH_CACHE) > 1024:
+                    try:
+                        oldest_key = next(iter(_AUTH_CACHE))
+                        _AUTH_CACHE.pop(oldest_key, None)
+                    except StopIteration:
+                        pass
+    return result
 
 # ------------ tag & number parsing ------------
 VAR_NAME = r"[A-Za-z_][A-Za-z0-9_]*"
@@ -199,15 +271,16 @@ def parse_mapping_text(raw: str) -> Tuple[Dict[str, str], Dict[str, Dict], Dict[
     if not raw: return text_map, image_map, loop_map
 
     SAFE = "\u241B"  # protect ://
-    protected = [line.replace("://", SAFE) for line in raw.splitlines()]
-    joined = "\n".join(protected)
-
     items: List[str] = []
-    for line in joined.splitlines():
-        if not line.strip(): continue
-        for seg in line.split(","):
+    for raw_line in raw.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        protected = line.replace("://", SAFE)
+        for seg in protected.split(","):
             seg = seg.strip()
-            if seg: items.append(seg.replace(SAFE, "://"))
+            if seg:
+                items.append(seg.replace(SAFE, "://"))
 
     loop_values: Dict[str, Dict[str, List[str]]] = {}
 
@@ -530,65 +603,112 @@ def _word_convert_placeholders(
     size_hints: Dict[str, Optional[float]],
     loop_map: Dict[str, List[Dict[str, str]]],
 ):
+    nodes, full_text = _word_snapshot(root)
+    if not nodes:
+        return
+
     loop_vars: Dict[str, str] = {}
-    loop_counter = [0]
+    loop_counter = 0
+    loop_occurrences: Dict[str, int] = {}
+    loop_field_hits: Dict[str, int] = {}
+    loop_stack: List[str] = []
 
     def _loop_var(group: str) -> str:
+        nonlocal loop_counter
         if group not in loop_vars:
-            loop_counter[0] += 1
-            loop_vars[group] = f"__loop_{loop_counter[0]}_{group}"
+            loop_counter += 1
+            loop_vars[group] = f"__loop_{loop_counter}_{group}"
         return loop_vars[group]
 
-    def _placeholder_to_jinja(expr: str) -> str:
-        expr_clean = (expr or "").strip()
-        if not expr_clean:
-            return ""
-        parts = [p.strip() for p in expr_clean.split(":") if p.strip()]
-        if not parts:
-            return ""
+    for match in WORD_INLINE_PATTERN.finditer(full_text):
+        expr = match.group("txt") or ""
+        expr = expr.strip()
+        if not expr:
+            continue
+        parts = [p.strip() for p in expr.split(":") if p.strip()]
         if len(parts) >= 2 and parts[1] == "loop":
             group = parts[0]
-            var_name = _loop_var(group)
-            if len(parts) == 2:
-                return f"{{% for {var_name} in loops.get('{group}', []) %}}"
-            field = parts[2] if len(parts) > 2 else ""
-            if not field:
-                return ""
-            return f"{{{{ {var_name}.get('{field}', '') }}}}"
-        group = parts[0]
-        if group in loop_vars or group in loop_map:
-            var_name = _loop_var(group)
-            field = parts[1] if len(parts) > 1 else ""
-            if not field:
-                return f"{{{{ {var_name} }}}}"
-            return f"{{{{ {var_name}.get('{field}', '') }}}}"
-        return f"{{{{ {expr_clean} }}}}"
+            loop_occurrences[group] = loop_occurrences.get(group, 0) + 1
 
-    while True:
-        nodes, full_text = _word_snapshot(root)
-        if not nodes:
+    pieces: List[str] = []
+    pos = 0
+
+    while pos < len(full_text):
+        next_placeholder = WORD_INLINE_PATTERN.search(full_text, pos)
+        next_end = full_text.find("#end", pos)
+
+        if next_end != -1 and (next_placeholder is None or next_end < next_placeholder.start()):
+            pieces.append(full_text[pos:next_end])
+            if loop_stack:
+                pieces.append("{%- endfor %}")
+                loop_stack.pop()
+            pos = next_end + 4
+            continue
+
+        if next_placeholder is None:
+            pieces.append(full_text[pos:])
             break
-        match = WORD_INLINE_PATTERN.search(full_text)
-        if not match:
-            break
-        var = match.group("img") or match.group("txt")
-        if not var:
-            break
-        if match.group("img"):
-            size = parse_size_mm(match.group("size") or "")
+
+        pieces.append(full_text[pos:next_placeholder.start()])
+
+        img_var = next_placeholder.group("img")
+        if img_var:
+            size = parse_size_mm(next_placeholder.group("size") or "")
             if size is not None:
-                size_hints.setdefault(var, size)
-        replacement = _placeholder_to_jinja(match.group("txt")) if match.group("txt") else f"{{{{ {var} }}}}"
-        _word_splice_text(nodes, match.start(), match.end(), replacement)
+                size_hints.setdefault(img_var, size)
+            pieces.append(f"{{{{ {img_var} }}}}")
+            pos = next_placeholder.end()
+            continue
 
-    while True:
-        nodes, full_text = _word_snapshot(root)
-        if not nodes:
-            break
-        idx = full_text.find("#end")
-        if idx == -1:
-            break
-        _word_splice_text(nodes, idx, idx + 4, "{% endfor %}")
+        expr = next_placeholder.group("txt") or ""
+        expr_clean = expr.strip()
+        parts = [p.strip() for p in expr_clean.split(":") if p.strip()]
+        replacement = next_placeholder.group(0)
+
+        if parts:
+            group = parts[0]
+            if len(parts) >= 2 and parts[1] == "loop":
+                var_name = _loop_var(group)
+                if len(parts) == 2:
+                    loop_stack.append(group)
+                    replacement = f"{{%- for {var_name} in loops.get('{group}', []) %}}"
+                else:
+                    field = parts[2] if len(parts) > 2 else ""
+                    if field:
+                        replacement = f"{{{{ {var_name}.get('{field}', '') }}}}"
+                    else:
+                        replacement = f"{{{{ {var_name} }}}}"
+                    loop_field_hits[group] = loop_field_hits.get(group, 0) + 1
+                if group in loop_occurrences:
+                    loop_occurrences[group] -= 1
+                if (
+                    loop_occurrences.get(group, 0) <= 0
+                    and loop_field_hits.get(group, 0) > 0
+                    and loop_stack
+                    and loop_stack[-1] == group
+                ):
+                    replacement += "{%- endfor %}"
+                    loop_stack.pop()
+            else:
+                if group in loop_vars or group in loop_map:
+                    var_name = _loop_var(group)
+                    field = parts[1] if len(parts) > 1 else ""
+                    if field:
+                        replacement = f"{{{{ {var_name}.get('{field}', '') }}}}"
+                    else:
+                        replacement = f"{{{{ {var_name} }}}}"
+                else:
+                    replacement = f"{{{{ {expr_clean} }}}}"
+
+        pieces.append(replacement)
+        pos = next_placeholder.end()
+
+    while loop_stack:
+        pieces.append("{%- endfor %}")
+        loop_stack.pop()
+
+    converted = "".join(pieces)
+    _word_splice_text(nodes, 0, len(full_text), converted)
 
 WORD_JINJA_PATTERN = re.compile(r"\{\{\s*(?P<var>%s)\s*\}\}" % VAR_NAME)
 
@@ -1105,25 +1225,16 @@ def _xlsx_clear_cell_value(cell: ET.Element):
         del cell.attrib["t"]
 
 
-def _xlsx_find_loop_group_in_text(text: str) -> Optional[str]:
-    if not text:
-        return None
-    match = re.search(rf"\{{\s*(?P<group>{VAR_NAME})\s*:\s*loop\s*\}}", text)
-    return match.group("group") if match else None
+CELL_LOOP_GROUP_PATTERN = re.compile(
+    rf"\{{\s*(?P<group>{VAR_NAME})\s*:\s*(?:loop(?:\s*:\s*{VAR_NAME})?|{VAR_NAME})\s*\}}"
+)
 
 
-def _xlsx_cell_has_loop_token(text: str, group: str) -> bool:
-    if not text or not group:
-        return False
-    pattern = rf"\{{\s*{re.escape(group)}\s*:\s*loop(?:\s*:\s*{VAR_NAME})?\s*\}}"
-    return re.search(pattern, text) is not None
-
-
-def _xlsx_cell_has_group_field_token(text: str, group: str) -> bool:
-    if not text or not group:
-        return False
-    pattern = rf"\{{\s*{re.escape(group)}\s*:\s*(?:loop\s*:\s*)?{VAR_NAME}\s*\}}"
-    return re.search(pattern, text) is not None
+def _xlsx_cell_loop_groups(text: str, loop_map: Dict[str, List[Dict[str, str]]]) -> Set[str]:
+    if not text or not loop_map:
+        return set()
+    groups = {match.group("group") for match in CELL_LOOP_GROUP_PATTERN.finditer(text)}
+    return {group for group in groups if group in loop_map}
 
 
 def _xlsx_apply_loop_text(
@@ -1169,260 +1280,60 @@ def _xlsx_expand_loops(
 ):
     loop_map = loop_map or {}
 
+    if not loop_map:
+        return
+
     ns = {"s": S_NS}
     sheet_data = sheet_root.find("s:sheetData", ns)
     if sheet_data is None:
         return
 
-    rows = list(sheet_data.findall("s:row", ns))
-    idx = 0
-    while idx < len(rows):
-        row = rows[idx]
-        group: Optional[str] = None
-        start_cell_text: Optional[str] = None
+    for row in sheet_data.findall("s:row", ns):
         for cell in row.findall("s:c", ns):
-            raw_text = _xlsx_cell_text(cell, ns, shared_strings) or ""
-            text = raw_text.strip()
-            if not text:
+            original_text = _xlsx_cell_text(cell, ns, shared_strings)
+            if original_text is None:
                 continue
-            detected_group = _xlsx_find_loop_group_in_text(text)
-            if detected_group:
-                if group and detected_group != group:
-                    raise ValueError(
-                        "Multiple loop groups in a single row are not supported"
-                    )
-                group = detected_group
-                start_cell_text = raw_text
-        if not group:
-            idx += 1
-            continue
-
-        start_pattern = re.compile(
-            rf"^\s*\{{\s*{re.escape(group)}\s*:\s*loop\s*\}}\s*$"
-        )
-        strict_applied = False
-        if start_cell_text and start_pattern.match(start_cell_text):
-            group_field_pattern = re.compile(
-                rf"\{{\s*{re.escape(group)}\s*:\s*{VAR_NAME}\s*\}}"
-            )
-            loop_field_pattern = re.compile(
-                rf"\{{\s*{re.escape(group)}\s*:\s*loop\s*:\s*{VAR_NAME}\s*\}}"
-            )
-            end_idx = idx + 1
-            end_row: Optional[ET.Element] = None
-            while end_idx < len(rows):
-                candidate_row = rows[end_idx]
-                found_end = False
-                for cell in candidate_row.findall("s:c", ns):
-                    raw_text = _xlsx_cell_text(cell, ns, shared_strings) or ""
-                    text = raw_text.strip()
-                    if not text:
-                        continue
-                    if text == "#end":
-                        if not re.fullmatch(r"\s*#end\s*", raw_text):
-                            break
-                        found_end = True
-                        break
-                if found_end:
-                    end_row = candidate_row
-                    break
-                end_idx += 1
-
-            if end_row is not None:
-                block_rows = rows[idx + 1 : end_idx]
-                template_bases = [copy.deepcopy(r) for r in block_rows]
-                if template_bases:
-                    entries = loop_map.get(group) or []
-
-                    if entries:
-                        for remove_row in [row] + block_rows + [end_row]:
-                            sheet_data.remove(remove_row)
-
-                        insert_pos = idx
-
-                        for entry_idx, entry in enumerate(entries):
-                            for tmpl in template_bases:
-                                clone = copy.deepcopy(tmpl)
-                                for cell in clone.findall("s:c", ns):
-                                    original_text = _xlsx_cell_text(
-                                        cell, ns, shared_strings
-                                    )
-                                    if original_text is None:
-                                        original_text = ""
-                                    has_group_token = bool(
-                                        loop_field_pattern.search(original_text)
-                                        or group_field_pattern.search(original_text)
-                                        or _xlsx_cell_has_loop_token(
-                                            original_text, group
-                                        )
-                                    )
-                                    replaced = _xlsx_apply_loop_text(
-                                        original_text, group, entry, text_map
-                                    )
-                                    if replaced != original_text or has_group_token:
-                                        if replaced:
-                                            _xlsx_set_inline_text(
-                                                cell, ns, replaced
-                                            )
-                                        else:
-                                            _xlsx_clear_cell_value(cell)
-                                if clone.findall("s:c", ns):
-                                    sheet_data.insert(insert_pos, clone)
-                                    insert_pos += 1
-
-                        rows = list(sheet_data.findall("s:row", ns))
-                        idx = insert_pos
-                        strict_applied = True
-                    else:
-                        def _clear_loop_row(target_row: ET.Element):
-                            for cell in list(target_row.findall("s:c", ns)):
-                                original_text = _xlsx_cell_text(
-                                    cell, ns, shared_strings
-                                )
-                                if original_text is None:
-                                    continue
-                                has_token = (
-                                    loop_field_pattern.search(original_text)
-                                    or group_field_pattern.search(original_text)
-                                    or _xlsx_cell_has_loop_token(
-                                        original_text, group
-                                    )
-                                    or "#end" in original_text
-                                )
-                                if not has_token:
-                                    continue
-                                replaced = _xlsx_apply_loop_text(
-                                    original_text, group, {}, text_map
-                                )
-                                if replaced:
-                                    _xlsx_set_inline_text(cell, ns, replaced)
-                                else:
-                                    _xlsx_clear_cell_value(cell)
-
-                        _clear_loop_row(row)
-                        for template_row in block_rows:
-                            _clear_loop_row(template_row)
-                        _clear_loop_row(end_row)
-                        rows = list(sheet_data.findall("s:row", ns))
-                        idx = end_idx + 1
-                        strict_applied = True
-        if strict_applied:
-            continue
-
-        legacy_end_idx = idx
-        while legacy_end_idx < len(rows):
-            candidate_row = rows[legacy_end_idx]
-            has_group_token = False
-            for cell in candidate_row.findall("s:c", ns):
-                raw_text = _xlsx_cell_text(cell, ns, shared_strings) or ""
-                text = raw_text.strip()
-                if not text:
-                    continue
-                if text == "#end":
-                    if not re.fullmatch(r"\s*#end\s*", raw_text):
-                        raise ValueError(
-                            f"Loop end marker for '{group}' must be '#end' only"
-                        )
-                    found_end = True
-                    break
-            if not has_group_token:
-                if legacy_end_idx == idx:
-                    has_group_token = True
+            groups = _xlsx_cell_loop_groups(original_text, loop_map)
+            if not groups:
+                if original_text and re.fullmatch(r"\s*#end\s*", original_text):
+                    _xlsx_clear_cell_value(cell)
+                continue
+            if len(groups) > 1:
+                merged = original_text
+                for group in groups:
+                    merged = _xlsx_apply_loop_text(merged, group, {}, text_map) or ""
+                if merged:
+                    _xlsx_set_inline_text(cell, ns, merged)
                 else:
-                    break
-            legacy_end_idx += 1
+                    _xlsx_clear_cell_value(cell)
+                continue
 
-        block_rows = rows[idx:legacy_end_idx]
-        if not block_rows:
-            idx += 1
-            continue
-
-        template_bases = [copy.deepcopy(r) for r in block_rows]
-        cleaned_templates: List[ET.Element] = []
-        for base in template_bases:
-            for cell in list(base.findall("s:c", ns)):
-                cell_text = (_xlsx_cell_text(cell, ns, shared_strings) or "").strip()
-                if not cell_text:
-                    continue
-                if cell_text == "#end":
-                    base.remove(cell)
-            if base.findall("s:c", ns):
-                cleaned_templates.append(base)
-        template_bases = cleaned_templates or template_bases
-
-        entries = loop_map.get(group) or []
-        if entries:
-            for original in block_rows:
-                sheet_data.remove(original)
-
-            insert_pos = idx
-            for entry_idx, entry in enumerate(entries):
-                for tmpl in template_bases:
-                    clone = copy.deepcopy(tmpl)
-                    for cell in list(clone.findall("s:c", ns)):
-                        original_text = _xlsx_cell_text(cell, ns, shared_strings)
-                        if original_text is None:
-                            continue
-                        has_group_token = _xlsx_cell_has_loop_token(
-                            original_text, group
-                        )
-                        replaced = _xlsx_apply_loop_text(
-                            original_text, group, entry, text_map
-                        )
-                        if entry_idx > 0 and not has_group_token:
-                            clone.remove(cell)
-                            continue
-                        if (
-                            replaced != original_text
-                            or has_group_token
-                            or "#end" in original_text
-                        ):
-                            if replaced:
-                                _xlsx_set_inline_text(cell, ns, replaced)
-                            else:
-                                _xlsx_clear_cell_value(cell)
-                    if clone.findall("s:c", ns):
-                        sheet_data.insert(insert_pos, clone)
-                        insert_pos += 1
-
-            rows = list(sheet_data.findall("s:row", ns))
-            idx = insert_pos
-        else:
-            def _clear_row_tokens(target_row: ET.Element):
-                for cell in list(target_row.findall("s:c", ns)):
-                    original_text = _xlsx_cell_text(cell, ns, shared_strings)
-                    if original_text is None:
-                        continue
-                    has_token = (
-                        _xlsx_cell_has_loop_token(original_text, group)
-                        or _xlsx_cell_has_group_field_token(original_text, group)
-                        or "#end" in original_text
-                    )
-                    if not has_token:
-                        continue
-                    replaced = _xlsx_apply_loop_text(
-                        original_text, group, {}, text_map
-                    )
-                    if replaced:
-                        _xlsx_set_inline_text(cell, ns, replaced)
-                    else:
-                        _xlsx_clear_cell_value(cell)
-
-            for template_row in block_rows:
-                _clear_row_tokens(template_row)
-            rows = list(sheet_data.findall("s:row", ns))
-            idx = legacy_end_idx
+            group = next(iter(groups))
+            entries = loop_map.get(group) or []
+            template = original_text
+            if entries:
+                fragments = [
+                    _xlsx_apply_loop_text(template, group, entry, text_map) or ""
+                    for entry in entries
+                ]
+                result = "\n".join(fragments)
+            else:
+                result = _xlsx_apply_loop_text(template, group, {}, text_map) or ""
+            if result:
+                _xlsx_set_inline_text(cell, ns, result)
+            else:
+                _xlsx_clear_cell_value(cell)
 
     _xlsx_reindex_rows(sheet_data, ns)
 
 
 def _decode_base64_payload(payload: str) -> Optional[bytes]:
-    data = (payload or "").strip()
+    data = re.sub(r"\s+", "", payload or "")
     if not data:
         return None
-    padding = len(data) % 4
+    padding = (-len(data)) % 4
     if padding:
-        data += "=" * (4 - padding)
+        data += "=" * padding
     try:
         return base64.b64decode(data, validate=False)
     except (binascii.Error, ValueError):
@@ -1452,11 +1363,12 @@ def _xlsx_fetch_image_bytes(source: str) -> Optional[bytes]:
     if text.startswith("base64,"):
         return _decode_base64_payload(text[7:])
 
+    session = _get_generic_http_session()
     try:
-        resp = requests.get(text, timeout=20)
+        resp = session.get(text, timeout=_generic_http_timeout())
         resp.raise_for_status()
         return resp.content
-    except Exception:
+    except requests.RequestException:
         return None
 
 
@@ -2432,9 +2344,10 @@ def _download_template_from_url(url: str) -> Tuple[Optional[bytes], Optional[str
     if not source:
         return None, None
     try:
-        resp = requests.get(source, timeout=30)
+        session = _get_generic_http_session()
+        resp = session.get(source, timeout=_generic_http_timeout())
         resp.raise_for_status()
-    except Exception:
+    except requests.RequestException:
         return None, None
     data = resp.content
     mime = resp.headers.get("Content-Type", "")
