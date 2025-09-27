@@ -13,7 +13,7 @@ import xml.etree.ElementTree as ET
 from decimal import Decimal
 from lxml import etree as LET
 from jinja2 import Environment, DebugUndefined
-from typing import Dict, Tuple, List, Optional, Set
+from typing import Any, Dict, Tuple, List, Optional, Set, Mapping
 import urllib.parse
 
 import requests
@@ -112,7 +112,13 @@ def run(cmd: List[str], cwd: Optional[str] = None):
     return proc
 
 def ok(d): return JSONResponse(status_code=200, content=d)
-def err(m, status=400): return JSONResponse(status_code=status, content={"error": str(m)})
+def err(message, status=400):
+    if isinstance(message, Mapping):
+        payload = dict(message)
+        if "error" not in payload:
+            payload["error"] = str(payload.get("message", "")) or "Unknown error"
+        return JSONResponse(status_code=status, content=payload)
+    return JSONResponse(status_code=status, content={"error": str(message)})
 
 
 def _auth_api_timeout() -> float:
@@ -2393,7 +2399,13 @@ async def merge(
             if _auth_soft_fail_enabled():
                 auth_warning = str(exc)
             else:
-                return err(str(exc), status=503)
+                return err(
+                    {
+                        "message": "Authentication service temporarily unavailable. Please try again later.",
+                        "details": str(exc),
+                    },
+                    status=503,
+                )
 
         template_bytes: Optional[bytes] = None
         ext = ""
