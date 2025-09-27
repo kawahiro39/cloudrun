@@ -8,31 +8,21 @@ import zipfile
 import shutil
 import subprocess
 import threading
-import time
 import xml.etree.ElementTree as ET
 from decimal import Decimal
 from lxml import etree as LET
 from jinja2 import Environment, DebugUndefined
-from typing import Dict, Tuple, List, Optional, Set
+from typing import Any, Dict, Tuple, List, Optional, Set, Mapping
 import urllib.parse
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from fastapi import FastAPI, UploadFile, File, Form, Header
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 
-DEFAULT_AUTH_API_BASE_URL = "https://auth-677366504119.asia-northeast1.run.app"
-
-_AUTH_SESSION_LOCAL = threading.local()
-_AUTH_CACHE_LOCK = threading.Lock()
-_AUTH_CACHE: Dict[str, Tuple[float, bool]] = {}
 _GENERIC_HTTP_SESSION_LOCAL = threading.local()
-
-
-class AuthServiceUnavailable(RuntimeError):
-    """Raised when the external auth validation service is unavailable."""
 
 
 def _build_retry(
@@ -58,21 +48,6 @@ def _configure_session(session: requests.Session, retry: Retry) -> requests.Sess
     adapter = HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=retry)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
-    return session
-
-
-def _get_auth_session() -> requests.Session:
-    session = getattr(_AUTH_SESSION_LOCAL, "session", None)
-    if session is None:
-        retry = _build_retry(
-            total=int(os.environ.get("AUTH_API_RETRIES", "3")),
-            connect=int(os.environ.get("AUTH_API_RETRIES_CONNECT", "3")),
-            read=int(os.environ.get("AUTH_API_RETRIES_READ", "3")),
-            status=int(os.environ.get("AUTH_API_RETRIES_STATUS", "3")),
-            backoff_factor=float(os.environ.get("AUTH_API_RETRY_BACKOFF", "0.5")),
-        )
-        session = _configure_session(requests.Session(), retry)
-        _AUTH_SESSION_LOCAL.session = session
     return session
 
 
@@ -112,18 +87,13 @@ def run(cmd: List[str], cwd: Optional[str] = None):
     return proc
 
 def ok(d): return JSONResponse(status_code=200, content=d)
-def err(m, status=400): return JSONResponse(status_code=status, content={"error": str(m)})
-
-
-def _auth_api_timeout() -> float:
-    try:
-        return float(os.environ.get("AUTH_API_TIMEOUT", "5"))
-    except ValueError:
-        return 5.0
-
-
-def _auth_soft_fail_enabled() -> bool:
-    return (os.environ.get("AUTH_ALLOW_ON_UNAVAILABLE", "true").lower() in {"1", "true", "yes", "on"})
+def err(message, status=400):
+    if isinstance(message, Mapping):
+        payload = dict(message)
+        if "error" not in payload:
+            payload["error"] = str(payload.get("message", "")) or "Unknown error"
+        return JSONResponse(status_code=status, content=payload)
+    return JSONResponse(status_code=status, content={"error": str(message)})
 
 
 def _generic_http_timeout() -> float:
@@ -132,64 +102,6 @@ def _generic_http_timeout() -> float:
     except ValueError:
         return 20.0
 
-
-def validate_auth_id(auth_id: str) -> bool:
-    base_url = (os.environ.get("AUTH_API_BASE_URL") or DEFAULT_AUTH_API_BASE_URL or "").rstrip("/")
-    if not base_url:
-        raise RuntimeError("AUTH_API_BASE_URL is not configured")
-    if not auth_id:
-        return False
-
-    try:
-        cache_ttl = max(float(os.environ.get("AUTH_API_CACHE_TTL", "30")), 0.0)
-    except ValueError:
-        cache_ttl = 30.0
-    if cache_ttl:
-        now = time.monotonic()
-        with _AUTH_CACHE_LOCK:
-            cached = _AUTH_CACHE.get(auth_id)
-            if cached and cached[0] >= now:
-                return cached[1]
-
-    url = f"{base_url}/auth-ids/verify"
-    payload = {"auth_id": auth_id}
-    session = _get_auth_session()
-    try:
-        resp = session.post(url, json=payload, timeout=_auth_api_timeout())
-    except requests.RequestException as exc:
-        raise AuthServiceUnavailable(f"auth_id validation request failed: {exc}")
-
-    if resp.status_code in {401, 404}:
-        return False
-    if resp.status_code >= 400:
-        if resp.status_code >= 500:
-            raise AuthServiceUnavailable(
-                f"auth_id validation service unavailable (status {resp.status_code})"
-            )
-        raise RuntimeError(f"auth_id validation failed with status {resp.status_code}")
-
-    try:
-        data = resp.json()
-    except ValueError as exc:
-        raise RuntimeError("auth_id validation returned invalid JSON") from exc
-
-    result = bool(data.get("is_valid"))
-    if cache_ttl:
-        expires_at = time.monotonic() + cache_ttl
-        with _AUTH_CACHE_LOCK:
-            _AUTH_CACHE[auth_id] = (expires_at, result)
-            if len(_AUTH_CACHE) > 1024:
-                cutoff = time.monotonic()
-                stale = [k for k, (expiry, _) in _AUTH_CACHE.items() if expiry < cutoff]
-                for key in stale:
-                    _AUTH_CACHE.pop(key, None)
-                if len(_AUTH_CACHE) > 1024:
-                    try:
-                        oldest_key = next(iter(_AUTH_CACHE))
-                        _AUTH_CACHE.pop(oldest_key, None)
-                    except StopIteration:
-                        pass
-    return result
 
 # ------------ tag & number parsing ------------
 VAR_NAME = r"[A-Za-z_][A-Za-z0-9_]*"
@@ -2370,31 +2282,10 @@ async def merge(
     return_document: bool = Form(True),
     file_data_uri: str = Form(""),
     file_url: str = Form(""),
-    x_auth_id: Optional[str] = Header(None, alias="X-Auth-Id"),
-    authorization: Optional[str] = Header(None),
 ):
     from pypdf import PdfReader  # lazy import
 
     try:
-        auth_id = x_auth_id or ""
-        if not auth_id and authorization:
-            auth_id = authorization.strip()
-            if auth_id.lower().startswith("bearer "):
-                auth_id = auth_id[7:].strip()
-
-        if not auth_id:
-            return err("missing auth_id", status=401)
-
-        auth_warning: Optional[str] = None
-        try:
-            if not validate_auth_id(auth_id):
-                return err("invalid auth_id", status=401)
-        except AuthServiceUnavailable as exc:
-            if _auth_soft_fail_enabled():
-                auth_warning = str(exc)
-            else:
-                return err(str(exc), status=503)
-
         template_bytes: Optional[bytes] = None
         ext = ""
         if file is not None:
@@ -2488,9 +2379,6 @@ async def merge(
 
             if not response:
                 response["message"] = "No outputs requested"
-
-            if auth_warning:
-                response.setdefault("warnings", []).append(auth_warning)
 
             return ok(response)
     except Exception as e:
