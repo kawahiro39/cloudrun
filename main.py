@@ -1165,28 +1165,83 @@ def _xlsx_expand_loops(
             idx += 1
             continue
 
-        start_pattern = re.compile(rf"^\s*\{{\s*{re.escape(group)}\s*:\s*loop\s*\}}\s*$")
-        if not start_cell_text or not start_pattern.match(start_cell_text):
-            raise ValueError(
-                f"Loop start for '{group}' must be a standalone '{{{group}:loop}}' cell"
-            )
-
-        group_field_pattern = re.compile(
-            rf"\{{\s*{re.escape(group)}\s*:\s*{VAR_NAME}\s*\}}"
+        start_pattern = re.compile(
+            rf"^\s*\{{\s*{re.escape(group)}\s*:\s*loop\s*\}}\s*$"
         )
-        loop_field_pattern = re.compile(
-            rf"\{{\s*{re.escape(group)}\s*:\s*loop\s*:\s*{VAR_NAME}\s*\}}"
-        )
-        if loop_field_pattern.search(start_cell_text):
-            raise ValueError(
-                f"Loop start cell for '{group}' cannot contain field placeholders"
+        strict_applied = False
+        if start_cell_text and start_pattern.match(start_cell_text):
+            group_field_pattern = re.compile(
+                rf"\{{\s*{re.escape(group)}\s*:\s*{VAR_NAME}\s*\}}"
             )
+            loop_field_pattern = re.compile(
+                rf"\{{\s*{re.escape(group)}\s*:\s*loop\s*:\s*{VAR_NAME}\s*\}}"
+            )
+            end_idx = idx + 1
+            end_row: Optional[ET.Element] = None
+            while end_idx < len(rows):
+                candidate_row = rows[end_idx]
+                found_end = False
+                for cell in candidate_row.findall("s:c", ns):
+                    raw_text = _xlsx_cell_text(cell, ns, shared_strings) or ""
+                    text = raw_text.strip()
+                    if not text:
+                        continue
+                    if text == "#end":
+                        if not re.fullmatch(r"\s*#end\s*", raw_text):
+                            break
+                        found_end = True
+                        break
+                if found_end:
+                    end_row = candidate_row
+                    break
+                end_idx += 1
 
-        end_idx = idx + 1
-        end_row: Optional[ET.Element] = None
-        while end_idx < len(rows):
-            candidate_row = rows[end_idx]
-            found_end = False
+            if end_row is not None:
+                block_rows = rows[idx + 1 : end_idx]
+                template_bases = [copy.deepcopy(r) for r in block_rows]
+                if template_bases:
+                    for remove_row in [row] + block_rows + [end_row]:
+                        sheet_data.remove(remove_row)
+
+                    entries = loop_map.get(group, [])
+                    insert_pos = idx
+
+                    if entries:
+                        for entry_idx, entry in enumerate(entries):
+                            for tmpl in template_bases:
+                                clone = copy.deepcopy(tmpl)
+                                for cell in clone.findall("s:c", ns):
+                                    original_text = _xlsx_cell_text(
+                                        cell, ns, shared_strings
+                                    )
+                                    if original_text is None:
+                                        original_text = ""
+                                    has_group_token = bool(
+                                        loop_field_pattern.search(original_text)
+                                        or group_field_pattern.search(original_text)
+                                        or _xlsx_cell_has_loop_token(
+                                            original_text, group
+                                        )
+                                    )
+                                    replaced = _xlsx_apply_loop_text(
+                                        original_text, group, entry, text_map
+                                    )
+                                    if replaced != original_text or has_group_token:
+                                        _xlsx_set_inline_text(cell, ns, replaced)
+                                if clone.findall("s:c", ns):
+                                    sheet_data.insert(insert_pos, clone)
+                                    insert_pos += 1
+
+                    rows = list(sheet_data.findall("s:row", ns))
+                    idx = insert_pos
+                    strict_applied = True
+        if strict_applied:
+            continue
+
+        legacy_end_idx = idx
+        while legacy_end_idx < len(rows):
+            candidate_row = rows[legacy_end_idx]
+            has_group_token = False
             for cell in candidate_row.findall("s:c", ns):
                 raw_text = _xlsx_cell_text(cell, ns, shared_strings) or ""
                 text = raw_text.strip()
@@ -1199,23 +1254,33 @@ def _xlsx_expand_loops(
                         )
                     found_end = True
                     break
-            if found_end:
-                end_row = candidate_row
-                break
-            end_idx += 1
+            if not has_group_token:
+                if legacy_end_idx == idx:
+                    has_group_token = True
+                else:
+                    break
+            legacy_end_idx += 1
 
-        if end_row is None:
-            raise ValueError(f"Loop '{group}' is missing a '#end' terminator")
+        block_rows = rows[idx:legacy_end_idx]
+        if not block_rows:
+            idx += 1
+            continue
 
-        block_rows = rows[idx + 1:end_idx]
         template_bases = [copy.deepcopy(r) for r in block_rows]
-        if not template_bases:
-            raise ValueError(
-                f"Loop '{group}' must include at least one row between start and '#end'"
-            )
+        cleaned_templates: List[ET.Element] = []
+        for base in template_bases:
+            for cell in list(base.findall("s:c", ns)):
+                cell_text = (_xlsx_cell_text(cell, ns, shared_strings) or "").strip()
+                if not cell_text:
+                    continue
+                if cell_text == "#end":
+                    base.remove(cell)
+            if base.findall("s:c", ns):
+                cleaned_templates.append(base)
+        template_bases = cleaned_templates or template_bases
 
-        for remove_row in [row] + block_rows + [end_row]:
-            sheet_data.remove(remove_row)
+        for original in block_rows:
+            sheet_data.remove(original)
 
         entries = loop_map.get(group, [])
         insert_pos = idx
@@ -1227,16 +1292,21 @@ def _xlsx_expand_loops(
                     for cell in clone.findall("s:c", ns):
                         original_text = _xlsx_cell_text(cell, ns, shared_strings)
                         if original_text is None:
-                            original_text = ""
-                        has_group_token = bool(
-                            loop_field_pattern.search(original_text)
-                            or group_field_pattern.search(original_text)
-                            or _xlsx_cell_has_loop_token(original_text, group)
+                            continue
+                        has_group_token = _xlsx_cell_has_loop_token(
+                            original_text, group
                         )
                         replaced = _xlsx_apply_loop_text(
                             original_text, group, entry, text_map
                         )
-                        if replaced != original_text or has_group_token:
+                        if entry_idx > 0 and not has_group_token:
+                            cells_to_remove.append(cell)
+                            continue
+                        if (
+                            replaced != original_text
+                            or has_group_token
+                            or "#end" in original_text
+                        ):
                             _xlsx_set_inline_text(cell, ns, replaced)
                     if clone.findall("s:c", ns):
                         sheet_data.insert(insert_pos, clone)
