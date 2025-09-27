@@ -1084,10 +1084,10 @@ def _xlsx_find_loop_group_in_text(text: str) -> Optional[str]:
     return match.group("group") if match else None
 
 
-def _xlsx_cell_has_group_token(text: str, group: str) -> bool:
+def _xlsx_cell_has_loop_token(text: str, group: str) -> bool:
     if not text or not group:
         return False
-    pattern = rf"\{{\s*{re.escape(group)}\s*:"
+    pattern = rf"\{{\s*{re.escape(group)}\s*:\s*loop(?:\s*:\s*{VAR_NAME})?\s*\}}"
     return re.search(pattern, text) is not None
 
 
@@ -1162,7 +1162,7 @@ def _xlsx_expand_loops(
                 text = (_xlsx_cell_text(cell, ns, shared_strings) or "").strip()
                 if not text:
                     continue
-                if text == "#end" or _xlsx_cell_has_group_token(text, group):
+                if text == "#end" or _xlsx_cell_has_loop_token(text, group):
                     has_group_token = True
                     break
             if not has_group_token and end_idx > idx:
@@ -1209,7 +1209,7 @@ def _xlsx_expand_loops(
                         original_text = _xlsx_cell_text(cell, ns, shared_strings)
                         if original_text is None:
                             continue
-                        has_group_token = _xlsx_cell_has_group_token(original_text, group)
+                        has_group_token = _xlsx_cell_has_loop_token(original_text, group)
                         replaced = _xlsx_apply_loop_text(original_text, group, entry, text_map)
                         if entry_idx > 0 and not has_group_token:
                             cells_to_remove.append(cell)
