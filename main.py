@@ -94,7 +94,6 @@ def err(message, status=400):
         return JSONResponse(status_code=status, content=payload)
     return JSONResponse(status_code=status, content={"error": str(message)})
 
-
 def _generic_http_timeout() -> float:
     try:
         return float(os.environ.get("HTTP_REQUEST_TIMEOUT", "20"))
