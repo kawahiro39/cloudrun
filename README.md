@@ -28,7 +28,9 @@ The server exposes a health check at `GET /healthz` and the main processing endp
 
 | Field | Location | Type | Description |
 |-------|----------|------|-------------|
-| `file` | form-data | file | Required `.docx` or `.xlsx` template |
+| `file` | form-data | file | `.docx` or `.xlsx` template upload |
+| `file_data_uri` | form-data | string | Alternative to `file`: template as data URI or Base64 |
+| `file_url` | form-data | string | Alternative to `file`: URL pointing to the template |
 | `mapping_text` | form-data | string | Placeholder/value mapping (see below) |
 | `filename` | form-data | string | Base name for generated files (defaults to `document`) |
 | `jpeg_dpi` | form-data | int | JPEG output DPI (default `150`) |
@@ -38,13 +40,14 @@ The server exposes a health check at `GET /healthz` and the main processing endp
 | `return_document` | form-data | bool | When `true`, include the patched `.docx`/`.xlsx` data URI |
 | `X-Auth-Id` | header | string | Required authentication token |
 
-Responses are JSON. Depending on the selected flags the payload can contain `pdf_data_uri`, `jpeg_data_uris`, and/or `document_data_uri` entries. All binary payloads are returned as data URIs with appropriate MIME types.
+Provide the Office template either as a multipart file upload (`file`), a data URI/Base64 string (`file_data_uri`), or a downloadable URL (`file_url`). Only one source is required. Responses are JSON. Depending on the selected flags the payload can contain `pdf_data_uri`, `jpeg_data_uris`, and/or `document_data_uri` entries. All binary payloads are returned as data URIs with appropriate MIME types.
 
 ### Placeholder syntax
 
 * Text placeholders: `{customer_name}`
 * Numeric-friendly placeholders: when the replacement text is a pure number or percentage the value is written as a number in Excel cells.
 * Image placeholders: `{[logo]}` or `{[logo:40mm]}`. The optional size is applied to the image width.
+* Loop placeholders (Word and Excel): wrap the repeated block with `{group:loop}` … `#end` and reference loop fields inside the block as `{group:loop:field}`.
 
 `mapping_text` accepts comma- or newline-separated pairs:
 
@@ -52,7 +55,13 @@ Responses are JSON. Depending on the selected flags the payload can contain `pdf
 {customer_name}:Alice Example
 {order_total}:12,345
 {[logo]}:https://example.com/logo.png
+{items:loop:item}:Widget A
+{items:loop:price}:1000
+{items:loop:item}:Widget B
+{items:loop:price}:2500
 ```
+
+Loop entries can be listed multiple times per field. The service groups entries that share the same loop name (`items` in the example above) and feeds them to templates in row order. In Word templates the section between `{items:loop}` and `#end` repeats for every row, while Excel templates duplicate the rows enclosed by the same markers. Fields missing values in a particular row default to empty strings.
 
 You can also inline newline substitutions using `<br>` inside the replacement text.
 

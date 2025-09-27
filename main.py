@@ -1,6 +1,7 @@
 import os
 import re
 import io
+import copy
 import base64
 import binascii
 import tempfile
@@ -97,11 +98,13 @@ def validate_auth_id(auth_id: str) -> bool:
 
 # ------------ tag & number parsing ------------
 VAR_NAME = r"[A-Za-z_][A-Za-z0-9_]*"
+VAR_PATH = r"[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*"
 IMG_KEY_PATTERN = re.compile(rf"^\{{\[(?P<var>{VAR_NAME})\](?::(?P<size>[^}}]+))?\}}$")
 TXT_KEY_PATTERN = re.compile(rf"^\{{(?P<var>{VAR_NAME})\}}$")
+LOOP_KEY_PATTERN = re.compile(rf"^\{{(?P<group>{VAR_NAME}):loop:(?P<field>{VAR_NAME})\}}$")
 IMG_TAG_PATTERN = re.compile(rf"\{{\[(?P<var>{VAR_NAME})\](?::(?P<size>[^}}]+))?\}}")
 WORD_INLINE_PATTERN = re.compile(
-    rf"(?<!\{{)\{{\s*(?:\[\s*(?P<img>{VAR_NAME})\s*\](?::(?P<size>[^}}]+))?|(?P<txt>{VAR_NAME}))\s*\}}(?!\}})"
+    rf"(?<!\{{)\{{\s*(?:\[\s*(?P<img>{VAR_NAME})\s*\](?::(?P<size>[^}}]+))?|(?P<txt>{VAR_PATH}))\s*\}}(?!\}})"
 )
 MM_RE      = re.compile(r'^\s*(\d+(?:\.\d+)?)\s*mm\s*$', re.IGNORECASE)
 NUM_PLAIN  = re.compile(r'^\s*-?\d+(?:\.\d+)?\s*$')
@@ -161,14 +164,15 @@ def _format_formula_value(value) -> Tuple[Optional[str], Optional[str]]:
 def _with_newlines(v: str) -> str:
     return (v or "").replace("<br>", "\n")
 
-def parse_mapping_text(raw: str) -> Tuple[Dict[str, str], Dict[str, Dict]]:
+def parse_mapping_text(raw: str) -> Tuple[Dict[str, str], Dict[str, Dict], Dict[str, List[Dict[str, str]]]]:
     """
     {a}:X,{b}:Y でも 改行でもOK。URL内カンマ保護。
     {[img]:50mm}:URL / {[img]}:URL
     """
     text_map: Dict[str, str] = {}
     image_map: Dict[str, Dict] = {}
-    if not raw: return text_map, image_map
+    loop_map: Dict[str, List[Dict[str, str]]] = {}
+    if not raw: return text_map, image_map, loop_map
 
     SAFE = "\u241B"  # protect ://
     protected = [line.replace("://", SAFE) for line in raw.splitlines()]
@@ -181,6 +185,8 @@ def parse_mapping_text(raw: str) -> Tuple[Dict[str, str], Dict[str, Dict]]:
             seg = seg.strip()
             if seg: items.append(seg.replace(SAFE, "://"))
 
+    loop_values: Dict[str, Dict[str, List[str]]] = {}
+
     for seg in items:
         if "}" not in seg:
             continue
@@ -190,16 +196,40 @@ def parse_mapping_text(raw: str) -> Tuple[Dict[str, str], Dict[str, Dict]]:
         if not key:
             continue
 
+        value_processed = _with_newlines(value)
+
         m_img = IMG_KEY_PATTERN.match(key)
         if m_img:
             v = m_img.group("var"); mm = parse_size_mm(m_img.group("size") or "")
             image_map[v] = {"url": value, "mm": mm}; continue
 
+        m_loop = LOOP_KEY_PATTERN.match(key)
+        if m_loop:
+            group = m_loop.group("group")
+            field = m_loop.group("field")
+            segments = value_processed.splitlines() or [""]
+            store = loop_values.setdefault(group, {}).setdefault(field, [])
+            store.extend(segments)
+            continue
+
         m_txt = TXT_KEY_PATTERN.match(key)
         if m_txt:
-            v = m_txt.group("var"); text_map[v] = _with_newlines(value); continue
+            v = m_txt.group("var"); text_map[v] = value_processed; continue
 
-    return text_map, image_map
+    for group, fields in loop_values.items():
+        lengths = [len(vals) for vals in fields.values() if vals]
+        max_len = max(lengths) if lengths else 0
+        rows: List[Dict[str, str]] = []
+        for idx in range(max_len):
+            row: Dict[str, str] = {}
+            for field, vals in fields.items():
+                row[field] = vals[idx] if idx < len(vals) else ""
+            if row:
+                rows.append(row)
+        if rows:
+            loop_map[group] = rows
+
+    return text_map, image_map, loop_map
 
 def _apply_text_tokens(text: Optional[str], text_map: Dict[str, str]) -> Optional[str]:
     if text is None or not text_map:
@@ -262,16 +292,59 @@ ET.register_namespace("s", S_NS)
 CELL_REF_RE = re.compile(r"^([A-Za-z]+)(\d+)$")
 
 
-def _xml_write_tree(tree: ET.ElementTree, path: str, default_namespace: Optional[str] = None):
-    kwargs = {"encoding": "utf-8", "xml_declaration": True}
-    if default_namespace:
-        try:
-            root = tree.getroot()
-        except Exception:
-            root = None
+def _xml_collect_namespaces(path: str) -> Dict[str, str]:
+    namespaces: Dict[str, str] = {}
+    if not os.path.exists(path):
+        return namespaces
+    try:
+        for _, (prefix, uri) in ET.iterparse(path, events=("start-ns",)):
+            if uri == XMLNS_NS:
+                continue
+            if prefix in namespaces:
+                continue
+            namespaces[prefix or ""] = uri
+    except Exception:
+        return namespaces
+    return namespaces
 
+
+def _xml_parse_tree(path: str) -> Tuple[ET.ElementTree, Dict[str, str]]:
+    namespaces = _xml_collect_namespaces(path)
+    tree = ET.parse(path)
+    return tree, namespaces
+
+
+def _xml_write_tree(
+    tree: ET.ElementTree,
+    path: str,
+    default_namespace: Optional[str] = None,
+    namespace_map: Optional[Dict[str, str]] = None,
+):
+    kwargs = {"encoding": "utf-8", "xml_declaration": True}
+    root: Optional[ET.Element] = None
+    try:
+        root = tree.getroot()
+    except Exception:
+        root = None
+
+    if namespace_map and root is not None:
+        for prefix, uri in namespace_map.items():
+            if prefix in {"xml", "xmlns"}:
+                continue
+            if prefix:
+                attr = f"{{{XMLNS_NS}}}{prefix}"
+                if root.get(attr) != uri:
+                    root.set(attr, uri)
+                try:
+                    ET.register_namespace(prefix, uri)
+                except ValueError:
+                    pass
+        if not default_namespace and "" in namespace_map:
+            default_namespace = namespace_map.get("")
+
+    if default_namespace:
+        missing: List[ET.Element] = []
         if root is not None:
-            missing: List[ET.Element] = []
             for node in root.iter():
                 tag = getattr(node, "tag", None)
                 if not isinstance(tag, str):
@@ -279,19 +352,80 @@ def _xml_write_tree(tree: ET.ElementTree, path: str, default_namespace: Optional
                 if not tag.startswith("{"):
                     missing.append(node)
 
-            if missing:
-                for node in missing:
-                    node.tag = f"{{{default_namespace}}}{node.tag}"
-                kwargs["default_namespace"] = default_namespace
-            else:
-                kwargs["default_namespace"] = default_namespace
+        if missing:
+            for node in missing:
+                node.tag = f"{{{default_namespace}}}{node.tag}"
+            kwargs["default_namespace"] = default_namespace
+    buffer = io.BytesIO()
     try:
-        tree.write(path, **kwargs)
+        tree.write(buffer, **kwargs)
     except ValueError as exc:
         if "non-qualified names" in str(exc) and kwargs.pop("default_namespace", None):
-            tree.write(path, **kwargs)
+            buffer = io.BytesIO()
+            tree.write(buffer, **kwargs)
         else:
             raise
+
+    xml_text = buffer.getvalue().decode("utf-8")
+
+    if namespace_map and root is not None:
+        insertions: List[str] = []
+        root_start = xml_text.find("<")
+        while root_start != -1 and root_start + 1 < len(xml_text) and xml_text[root_start + 1] in {"?", "!"}:
+            root_start = xml_text.find("<", root_start + 1)
+        root_end = xml_text.find(">", root_start if root_start != -1 else 0)
+        if root_start != -1 and root_end != -1:
+            root_tag = xml_text[root_start:root_end]
+            alias_pattern = re.compile(rf"\sxmlns:(ns\d+)=\"{re.escape(XMLNS_NS)}\"")
+            aliases = set(alias_pattern.findall(root_tag))
+            for alias in aliases:
+                root_tag = re.sub(rf"\sxmlns:{alias}=\"{re.escape(XMLNS_NS)}\"", "", root_tag)
+                root_tag = re.sub(rf"(\s){alias}:", r"\1xmlns:", root_tag)
+            if aliases:
+                xml_text = xml_text[:root_start] + root_tag + xml_text[root_end:]
+                root_end = xml_text.find(">", root_start)
+                root_tag = xml_text[root_start:root_end]
+
+            decl_pattern = re.compile(r"\sxmlns(?::([A-Za-z0-9_.\-]+))?=\"([^\"]+)\"")
+            seen_decl: Set[Tuple[str, str]] = set()
+
+            def _dedup_decl(match: re.Match[str]) -> str:
+                prefix = match.group(1) or ""
+                uri = match.group(2)
+                key = (prefix, uri)
+                if key in seen_decl:
+                    return ""
+                seen_decl.add(key)
+                return match.group(0)
+
+            root_tag = decl_pattern.sub(_dedup_decl, root_tag)
+            if seen_decl:
+                xml_text = xml_text[:root_start] + root_tag + xml_text[root_end:]
+                root_end = xml_text.find(">", root_start)
+                root_tag = xml_text[root_start:root_end]
+
+            existing_decls: Dict[str, str] = {}
+            for match in re.findall(r"xmlns(?::([A-Za-z0-9_.\-]+))?=\"([^\"]+)\"", root_tag):
+                prefix, uri = match
+                existing_decls[prefix or ""] = uri
+
+            default_uri = namespace_map.get("")
+            if default_uri and existing_decls.get("", "") != default_uri:
+                insertions.append(f' xmlns="{default_uri}"')
+            for prefix, uri in namespace_map.items():
+                if prefix in {"", "xml", "xmlns"}:
+                    continue
+                if existing_decls.get(prefix) == uri:
+                    continue
+                insertions.append(f" xmlns:{prefix}=\"{uri}\"")
+            if insertions:
+                insert_pos = root_end
+                if xml_text[insert_pos - 1] == "/":
+                    insert_pos -= 1
+                xml_text = xml_text[:insert_pos] + "".join(insertions) + xml_text[insert_pos:]
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(xml_text)
 
 def _word_set_text(node: LET._Element, text: str):
     run = node.getparent()
@@ -363,7 +497,45 @@ def _word_splice_text(nodes: List[Tuple[LET._Element, int, int]], start: int, en
             else:
                 node.text = remainder
 
-def _word_convert_placeholders(root, size_hints: Dict[str, Optional[float]]):
+def _word_convert_placeholders(
+    root,
+    size_hints: Dict[str, Optional[float]],
+    loop_map: Dict[str, List[Dict[str, str]]],
+):
+    loop_vars: Dict[str, str] = {}
+    loop_counter = [0]
+
+    def _loop_var(group: str) -> str:
+        if group not in loop_vars:
+            loop_counter[0] += 1
+            loop_vars[group] = f"__loop_{loop_counter[0]}_{group}"
+        return loop_vars[group]
+
+    def _placeholder_to_jinja(expr: str) -> str:
+        expr_clean = (expr or "").strip()
+        if not expr_clean:
+            return ""
+        parts = [p.strip() for p in expr_clean.split(":") if p.strip()]
+        if not parts:
+            return ""
+        if len(parts) >= 2 and parts[1] == "loop":
+            group = parts[0]
+            var_name = _loop_var(group)
+            if len(parts) == 2:
+                return f"{{% for {var_name} in loops.get('{group}', []) %}}"
+            field = parts[2] if len(parts) > 2 else ""
+            if not field:
+                return ""
+            return f"{{{{ {var_name}.get('{field}', '') }}}}"
+        group = parts[0]
+        if group in loop_vars or group in loop_map:
+            var_name = _loop_var(group)
+            field = parts[1] if len(parts) > 1 else ""
+            if not field:
+                return f"{{{{ {var_name} }}}}"
+            return f"{{{{ {var_name}.get('{field}', '') }}}}"
+        return f"{{{{ {expr_clean} }}}}"
+
     while True:
         nodes, full_text = _word_snapshot(root)
         if not nodes:
@@ -378,7 +550,17 @@ def _word_convert_placeholders(root, size_hints: Dict[str, Optional[float]]):
             size = parse_size_mm(match.group("size") or "")
             if size is not None:
                 size_hints.setdefault(var, size)
-        _word_splice_text(nodes, match.start(), match.end(), f"{{{{ {var} }}}}")
+        replacement = _placeholder_to_jinja(match.group("txt")) if match.group("txt") else f"{{{{ {var} }}}}"
+        _word_splice_text(nodes, match.start(), match.end(), replacement)
+
+    while True:
+        nodes, full_text = _word_snapshot(root)
+        if not nodes:
+            break
+        idx = full_text.find("#end")
+        if idx == -1:
+            break
+        _word_splice_text(nodes, idx, idx + 4, "{% endfor %}")
 
 WORD_JINJA_PATTERN = re.compile(r"\{\{\s*(?P<var>%s)\s*\}\}" % VAR_NAME)
 
@@ -494,7 +676,11 @@ def _word_content_xmls(extracted_dir: str) -> List[str]:
             if fn.startswith("footer") and fn.endswith(".xml"): targets.append(f"word/{fn}")
     return [os.path.join(extracted_dir, p) for p in targets if os.path.exists(os.path.join(extracted_dir, p))]
 
-def docx_convert_tags_to_jinja(in_docx: str, out_docx: str) -> Dict[str, Optional[float]]:
+def docx_convert_tags_to_jinja(
+    in_docx: str,
+    out_docx: str,
+    loop_map: Optional[Dict[str, List[Dict[str, str]]]] = None,
+) -> Dict[str, Optional[float]]:
     # {var}/{[var]} → {{ var }} へ。英数字+下線のタグのみ変換（Jinja誤爆防止）
     tmpdir = tempfile.mkdtemp()
     size_hints: Dict[str, Optional[float]] = {}
@@ -505,7 +691,7 @@ def docx_convert_tags_to_jinja(in_docx: str, out_docx: str) -> Dict[str, Optiona
             parser = LET.XMLParser(remove_blank_text=False)
             tree = LET.parse(p, parser)
             root = tree.getroot()
-            _word_convert_placeholders(root, size_hints)
+            _word_convert_placeholders(root, size_hints, loop_map or {})
             tree.write(p, encoding="utf-8", xml_declaration=True)
 
         with zipfile.ZipFile(out_docx, 'w', zipfile.ZIP_DEFLATED) as zout:
@@ -674,17 +860,26 @@ def _word_postprocess_docx(docx_path: str, text_map: Dict[str, str], assets: Dic
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-def docx_render(in_docx: str, out_docx: str, text_map: Dict[str, str], image_map: Dict[str, Dict]):
+def docx_render(
+    in_docx: str,
+    out_docx: str,
+    text_map: Dict[str, str],
+    image_map: Dict[str, Dict],
+    loop_map: Optional[Dict[str, List[Dict[str, str]]]] = None,
+):
     from docxtpl import DocxTemplate, InlineImage
     from docx.shared import Mm
 
     tmp = in_docx + ".jinja.docx"
-    size_hints = docx_convert_tags_to_jinja(in_docx, tmp)
+    resolved_loops: Dict[str, List[Dict[str, str]]] = loop_map or {}
+
+    size_hints = docx_convert_tags_to_jinja(in_docx, tmp, resolved_loops)
 
     doc = DocxTemplate(tmp)
     ctx: Dict[str, object] = {}
     for k, v in text_map.items():
         ctx[k] = v
+    ctx.setdefault("loops", resolved_loops)
     image_blobs: Dict[str, Dict[str, Optional[float]]] = {}
     for k, meta in image_map.items():
         r = requests.get(meta["url"], timeout=20); r.raise_for_status()
@@ -832,6 +1027,170 @@ def _xlsx_set_anchor_size(anchor_el: Optional[ET.Element], cx: int, cy: int):
         ext_el.set("cy", str(cy))
 
 
+def _xlsx_cell_text(
+    cell: ET.Element,
+    ns: Dict[str, str],
+    shared_strings: List[str],
+) -> str:
+    t_attr = cell.get("t")
+    if t_attr == "s":
+        v_node = cell.find("s:v", ns)
+        if v_node is None or v_node.text is None:
+            return ""
+        try:
+            idx = int(v_node.text)
+        except (TypeError, ValueError):
+            return ""
+        if 0 <= idx < len(shared_strings):
+            return shared_strings[idx] or ""
+        return ""
+    if t_attr == "inlineStr":
+        parts: List[str] = []
+        for t_node in cell.findall("s:is/s:t", ns):
+            parts.append(t_node.text or "")
+        return "".join(parts)
+    v_node = cell.find("s:v", ns)
+    if v_node is not None and v_node.text is not None:
+        return v_node.text
+    return ""
+
+
+def _xlsx_set_inline_text(cell: ET.Element, ns: Dict[str, str], text: str):
+    for child in list(cell):
+        if child.tag == f"{{{S_NS}}}f":
+            continue
+        cell.remove(child)
+    cell.set("t", "inlineStr")
+    is_node = ET.SubElement(cell, f"{{{S_NS}}}is")
+    t_node = ET.SubElement(is_node, f"{{{S_NS}}}t")
+    if text and (text.strip() != text or "\n" in text):
+        t_node.set(f"{{{XML_NS}}}space", "preserve")
+    t_node.text = text or ""
+
+
+def _xlsx_apply_loop_text(
+    text: str,
+    group: str,
+    entry: Dict[str, str],
+    text_map: Dict[str, str],
+) -> str:
+    result = text.replace(f"{{{group}:loop}}", "")
+    result = result.replace("#end", "")
+    for field, value in entry.items():
+        for token in (
+            f"{{{group}:{field}}}",
+            f"{{{group}:loop:{field}}}",
+        ):
+            result = result.replace(token, value or "")
+    result = _apply_text_tokens(result, text_map)
+    return result
+
+
+def _xlsx_reindex_rows(sheet_data: ET.Element, ns: Dict[str, str]):
+    for row_idx, row_el in enumerate(sheet_data.findall("s:row", ns), start=1):
+        row_el.set("r", str(row_idx))
+        for cell in row_el.findall("s:c", ns):
+            ref = cell.get("r")
+            if not ref:
+                continue
+            m = CELL_REF_RE.match(ref)
+            if not m:
+                continue
+            col_letters = m.group(1)
+            cell.set("r", f"{col_letters}{row_idx}")
+
+
+def _xlsx_expand_loops(
+    sheet_root: ET.Element,
+    shared_strings: List[str],
+    loop_map: Dict[str, List[Dict[str, str]]],
+    text_map: Dict[str, str],
+):
+    if not loop_map:
+        return
+
+    ns = {"s": S_NS}
+    sheet_data = sheet_root.find("s:sheetData", ns)
+    if sheet_data is None:
+        return
+
+    rows = list(sheet_data.findall("s:row", ns))
+    idx = 0
+    while idx < len(rows):
+        row = rows[idx]
+        group: Optional[str] = None
+        for cell in row.findall("s:c", ns):
+            text = (_xlsx_cell_text(cell, ns, shared_strings) or "").strip()
+            if not text:
+                continue
+            if text.startswith("{") and text.endswith("}"):
+                expr = text[1:-1].strip()
+                parts = [p.strip() for p in expr.split(":") if p.strip()]
+                if len(parts) >= 2 and parts[1] == "loop":
+                    group = parts[0]
+                    break
+        if not group:
+            idx += 1
+            continue
+
+        end_idx = idx + 1
+        while end_idx < len(rows):
+            end_row = rows[end_idx]
+            end_found = False
+            for cell in end_row.findall("s:c", ns):
+                text = (_xlsx_cell_text(cell, ns, shared_strings) or "").strip()
+                if text == "#end":
+                    end_found = True
+                    break
+            if end_found:
+                break
+            end_idx += 1
+        if end_idx >= len(rows):
+            break
+
+        block_rows = rows[idx:end_idx + 1]
+        template_bases = [copy.deepcopy(r) for r in block_rows]
+        cleaned_templates: List[ET.Element] = []
+        for base in template_bases:
+            for cell in list(base.findall("s:c", ns)):
+                cell_text = (_xlsx_cell_text(cell, ns, shared_strings) or "").strip()
+                if not cell_text:
+                    continue
+                if cell_text == "#end":
+                    base.remove(cell)
+                    continue
+                if cell_text.startswith("{") and cell_text.endswith("}"):
+                    expr = cell_text[1:-1].strip()
+                    parts = [p.strip() for p in expr.split(":") if p.strip()]
+                    if len(parts) >= 2 and parts[0] == group and parts[1] == "loop":
+                        base.remove(cell)
+            if base.findall("s:c", ns):
+                cleaned_templates.append(base)
+        template_bases = cleaned_templates or template_bases
+        for original in block_rows:
+            sheet_data.remove(original)
+
+        entries = loop_map.get(group, [])
+        insert_pos = idx
+        if entries:
+            for entry in entries:
+                for tmpl in template_bases:
+                    clone = copy.deepcopy(tmpl)
+                    for cell in clone.findall("s:c", ns):
+                        original_text = _xlsx_cell_text(cell, ns, shared_strings)
+                        if original_text is None:
+                            continue
+                        replaced = _xlsx_apply_loop_text(original_text, group, entry, text_map)
+                        if replaced != original_text or f"{{{group}:" in original_text or "#end" in original_text:
+                            _xlsx_set_inline_text(cell, ns, replaced)
+                    sheet_data.insert(insert_pos, clone)
+                    insert_pos += 1
+        rows = list(sheet_data.findall("s:row", ns))
+        idx = insert_pos if entries else idx
+
+    _xlsx_reindex_rows(sheet_data, ns)
+
+
 def _decode_base64_payload(payload: str) -> Optional[bytes]:
     data = (payload or "").strip()
     if not data:
@@ -885,7 +1244,7 @@ def _xlsx_update_content_types(extracted_dir: str, media_exts: Set[str], drawing
         return
 
     try:
-        tree = ET.parse(path)
+        tree, nsmap = _xml_parse_tree(path)
     except Exception:
         return
 
@@ -933,7 +1292,7 @@ def _xlsx_update_content_types(extracted_dir: str, media_exts: Set[str], drawing
         changed = True
 
     if changed:
-        _xml_write_tree(tree, path, default_namespace=CONTENT_TYPES_NS)
+        _xml_write_tree(tree, path, default_namespace=CONTENT_TYPES_NS, namespace_map=nsmap)
 
 
 def _xlsx_ensure_dir(path: str):
@@ -976,7 +1335,8 @@ def xlsx_force_full_recalc(extracted_dir: str):
     p = os.path.join(extracted_dir, "xl", "workbook.xml")
     if not os.path.exists(p): return
     ns = {"s": S_NS}
-    tree = ET.parse(p); root = tree.getroot()
+    tree, workbook_nsmap = _xml_parse_tree(p)
+    root = tree.getroot()
     calcPr = root.find("s:calcPr", ns)
     if calcPr is None:
         calcPr = ET.SubElement(root, f"{{{ns['s']}}}calcPr")
@@ -994,7 +1354,7 @@ def xlsx_force_full_recalc(extracted_dir: str):
         except: pass
     rels_path = os.path.join(extracted_dir, "xl", "_rels", "workbook.xml.rels")
     if os.path.exists(rels_path):
-        rels_tree = ET.parse(rels_path)
+        rels_tree, rels_nsmap = _xml_parse_tree(rels_path)
         rels_root = rels_tree.getroot()
         removed = False
         for rel in list(rels_root.findall(f".//{{{REL_NS}}}Relationship")):
@@ -1004,10 +1364,16 @@ def xlsx_force_full_recalc(extracted_dir: str):
                 rels_root.remove(rel)
                 removed = True
         if removed:
-            _xml_write_tree(rels_tree, rels_path, default_namespace=REL_NS)
+            default_rels_ns = rels_nsmap.get("") if rels_nsmap else REL_NS
+            _xml_write_tree(
+                rels_tree,
+                rels_path,
+                default_namespace=default_rels_ns,
+                namespace_map=rels_nsmap,
+            )
     ct_path = os.path.join(extracted_dir, "[Content_Types].xml")
     if os.path.exists(ct_path):
-        ct_tree = ET.parse(ct_path)
+        ct_tree, ct_nsmap = _xml_parse_tree(ct_path)
         ct_root = ct_tree.getroot()
         ns_ct = {"ct": CONTENT_TYPES_NS}
         removed = False
@@ -1017,8 +1383,13 @@ def xlsx_force_full_recalc(extracted_dir: str):
                 ct_root.remove(node)
                 removed = True
         if removed:
-            _xml_write_tree(ct_tree, ct_path, default_namespace=CONTENT_TYPES_NS)
-    tree.write(p, encoding="utf-8", xml_declaration=True)
+            _xml_write_tree(
+                ct_tree,
+                ct_path,
+                default_namespace=CONTENT_TYPES_NS,
+                namespace_map=ct_nsmap,
+            )
+    _xml_write_tree(tree, p, default_namespace=workbook_nsmap.get("") if workbook_nsmap else S_NS, namespace_map=workbook_nsmap)
 
 def _xlsx_escape_sheet_name(name: str) -> str:
     if not name:
@@ -1097,7 +1468,7 @@ def xlsx_update_formula_caches(xlsx_path: str, formula_cells: List[Dict]):
         with zipfile.ZipFile(xlsx_path, 'r') as zin:
             zin.extractall(tmpdir)
         ns = {"s": S_NS}
-        updated: Dict[str, ET.ElementTree] = {}
+        updated: Dict[str, Tuple[ET.ElementTree, Dict[str, str]]] = {}
         for info in formula_cells:
             sheet_file = info.get("sheet_file")
             cell_ref = info.get("cell_ref")
@@ -1108,8 +1479,9 @@ def xlsx_update_formula_caches(xlsx_path: str, formula_cells: List[Dict]):
             if not os.path.exists(sheet_path):
                 continue
             if sheet_file not in updated:
-                updated[sheet_file] = ET.parse(sheet_path)
-            tree = updated[sheet_file]
+                tree, nsmap = _xml_parse_tree(sheet_path)
+                updated[sheet_file] = (tree, nsmap)
+            tree, nsmap = updated[sheet_file]
             root = tree.getroot()
             cell = root.find(f".//s:c[@r='{cell_ref}']", ns)
             if cell is None:
@@ -1139,9 +1511,9 @@ def xlsx_update_formula_caches(xlsx_path: str, formula_cells: List[Dict]):
                         cell.set("t", original_type)
                     else:
                         cell.attrib.pop("t", None)
-        for sheet_file, tree in updated.items():
+        for sheet_file, (tree, nsmap) in updated.items():
             sheet_path = os.path.join(tmpdir, "xl", "worksheets", sheet_file)
-            tree.write(sheet_path, encoding="utf-8", xml_declaration=True)
+            _xml_write_tree(tree, sheet_path, namespace_map=nsmap)
         with zipfile.ZipFile(xlsx_path, 'w', zipfile.ZIP_DEFLATED) as zout:
             for root_dir, _, files in os.walk(tmpdir):
                 for fn in files:
@@ -1150,7 +1522,13 @@ def xlsx_update_formula_caches(xlsx_path: str, formula_cells: List[Dict]):
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str], image_map: Dict[str, Dict]):
+def xlsx_patch_and_place(
+    src_xlsx: str,
+    dst_xlsx: str,
+    text_map: Dict[str, str],
+    image_map: Dict[str, Dict],
+    loop_map: Optional[Dict[str, List[Dict[str, str]]]] = None,
+):
     """
     1) XML直編集で {var} を置換（完全一致は数値化、<br>→\n）、{[img]} はセルから除去し placements に記録
     2) drawing XML を直接編集して placements に新規画像挿入（既存図形/グラフは維持）
@@ -1161,6 +1539,9 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
     placements: List[Dict[str, object]] = []
     formula_cells: List[Dict[str, object]] = []
     sheet_drawings: Dict[str, List[Dict[str, object]]] = {}
+    shared_strings_values: List[str] = []
+    resolved_loops = loop_map or {}
+
     try:
         with zipfile.ZipFile(src_xlsx, 'r') as zin:
             zin.extractall(tmpdir)
@@ -1171,7 +1552,8 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
         img_sst_idx: Dict[int, Tuple[str, Optional[float]]] = {}
 
         if os.path.exists(sst_path):
-            tree = ET.parse(sst_path); root = tree.getroot(); idx = -1
+            tree, sst_nsmap = _xml_parse_tree(sst_path)
+            root = tree.getroot(); idx = -1
             for si in root.findall("s:si", ns):
                 idx += 1
                 t_nodes = si.findall("s:t", ns)
@@ -1186,6 +1568,7 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                     img_sst_idx[idx] = (var, size_hint)
                     for r in list(si): si.remove(r)
                     t = ET.SubElement(si, f"{{{ns['s']}}}t"); t.text = ""
+                    shared_strings_values.append("")
                     continue
 
                 # テキスト置換
@@ -1194,6 +1577,7 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                 # 書き戻し
                 for r in list(si): si.remove(r)
                 t = ET.SubElement(si, f"{{{ns['s']}}}t"); t.text = replaced
+                shared_strings_values.append(replaced or "")
 
                 # 完全一致 = 数値候補
                 txt_match = TXT_KEY_PATTERN.match(original or "")
@@ -1204,7 +1588,7 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                         num, _ = parse_numberlike(mapped)
                         numeric_candidates[idx] = ((num is not None), num)
 
-            tree.write(sst_path, encoding="utf-8", xml_declaration=True)
+            _xml_write_tree(tree, sst_path, namespace_map=sst_nsmap)
 
         # worksheets
         ws_dir = os.path.join(tmpdir, "xl", "worksheets")
@@ -1213,7 +1597,11 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
             for fn in os.listdir(ws_dir):
                 if not fn.endswith(".xml"): continue
                 p = os.path.join(ws_dir, fn)
-                tree = ET.parse(p); root = tree.getroot()
+                tree, sheet_nsmap = _xml_parse_tree(p)
+                root = tree.getroot()
+
+                if resolved_loops:
+                    _xlsx_expand_loops(root, shared_strings_values, resolved_loops, text_map)
 
                 sheet_name, sheet_index = sheet_map.get(fn, (None, None))
                 if sheet_index is None:
@@ -1323,7 +1711,7 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                             replaced = _apply_text_tokens(txt, text_map)
                             t_inline.text = replaced
 
-                tree.write(p, encoding="utf-8", xml_declaration=True)
+                _xml_write_tree(tree, p, namespace_map=sheet_nsmap)
 
         drawings_dir = os.path.join(tmpdir, "xl", "drawings")
         if image_map:
@@ -1345,36 +1733,37 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
             existing_media = set(os.listdir(media_dir)) if os.path.isdir(media_dir) else set()
             existing_drawings = set(os.listdir(drawings_dir)) if os.path.isdir(drawings_dir) else set()
 
-            sheet_tree_cache: Dict[str, ET.ElementTree] = {}
-            sheet_rels_cache: Dict[str, ET.ElementTree] = {}
+            sheet_tree_cache: Dict[str, Tuple[ET.ElementTree, Dict[str, str]]] = {}
+            sheet_rels_cache: Dict[str, Tuple[ET.ElementTree, Dict[str, str]]] = {}
             drawing_cache: Dict[str, Dict[str, object]] = {}
             used_media_exts: Set[str] = set()
             new_drawing_files: Set[str] = set()
 
             def _ensure_sheet_tree(sheet_file: str) -> Optional[ET.ElementTree]:
-                tree = sheet_tree_cache.get(sheet_file)
-                if tree is not None:
-                    return tree
+                cached = sheet_tree_cache.get(sheet_file)
+                if cached is not None:
+                    return cached[0]
                 path = os.path.join(tmpdir, "xl", "worksheets", sheet_file)
                 if not os.path.exists(path):
                     return None
-                tree = ET.parse(path)
-                sheet_tree_cache[sheet_file] = tree
+                tree, nsmap = _xml_parse_tree(path)
+                sheet_tree_cache[sheet_file] = (tree, nsmap)
                 return tree
 
             def _ensure_sheet_rels(sheet_file: str) -> ET.ElementTree:
-                tree = sheet_rels_cache.get(sheet_file)
-                if tree is not None:
-                    return tree
+                cached = sheet_rels_cache.get(sheet_file)
+                if cached is not None:
+                    return cached[0]
                 rels_dir = os.path.join(tmpdir, "xl", "worksheets", "_rels")
                 _xlsx_ensure_dir(rels_dir)
                 path = os.path.join(rels_dir, f"{sheet_file}.rels")
                 if os.path.exists(path):
-                    tree = ET.parse(path)
+                    tree, nsmap = _xml_parse_tree(path)
                 else:
                     root_rels = ET.Element(f"{{{REL_NS}}}Relationships")
                     tree = ET.ElementTree(root_rels)
-                sheet_rels_cache[sheet_file] = tree
+                    nsmap = {"": REL_NS}
+                sheet_rels_cache[sheet_file] = (tree, nsmap)
                 return tree
 
             def _ensure_drawing_state(drawing_name: str) -> Optional[Dict[str, object]]:
@@ -1383,23 +1772,27 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                     return state
                 drawing_path = os.path.join(drawings_dir, drawing_name)
                 if os.path.exists(drawing_path):
-                    tree = ET.parse(drawing_path)
+                    tree, drawing_nsmap = _xml_parse_tree(drawing_path)
                 else:
                     root = ET.Element(f"{{{XDR_NS}}}wsDr")
                     tree = ET.ElementTree(root)
+                    drawing_nsmap = {"": XDR_NS}
                 root = tree.getroot()
                 drawing_rels_path = os.path.join(drawings_rels_dir, f"{drawing_name}.rels")
                 if os.path.exists(drawing_rels_path):
-                    rels_tree = ET.parse(drawing_rels_path)
+                    rels_tree, drawing_rels_nsmap = _xml_parse_tree(drawing_rels_path)
                 else:
                     rels_root = ET.Element(f"{{{REL_NS}}}Relationships")
                     rels_tree = ET.ElementTree(rels_root)
+                    drawing_rels_nsmap = {"": REL_NS}
                 state = {
                     "tree": tree,
                     "root": root,
+                    "nsmap": drawing_nsmap,
                     "path": drawing_path,
                     "rels_tree": rels_tree,
                     "rels_path": drawing_rels_path,
+                    "rels_nsmap": drawing_rels_nsmap,
                     "max_id": _xlsx_max_docpr_id(root),
                 }
                 drawing_cache[drawing_name] = state
@@ -1673,22 +2066,31 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
 
             _xlsx_update_content_types(tmpdir, used_media_exts, new_drawing_files)
 
-            for sheet_file, tree in sheet_tree_cache.items():
+            for sheet_file, (tree, nsmap) in sheet_tree_cache.items():
                 path = os.path.join(tmpdir, "xl", "worksheets", sheet_file)
-                tree.write(path, encoding="utf-8", xml_declaration=True)
-            for sheet_file, tree in sheet_rels_cache.items():
+                _xml_write_tree(tree, path, namespace_map=nsmap)
+            for sheet_file, (tree, nsmap) in sheet_rels_cache.items():
                 rels_dir = os.path.join(tmpdir, "xl", "worksheets", "_rels")
                 _xlsx_ensure_dir(rels_dir)
                 path = os.path.join(rels_dir, f"{sheet_file}.rels")
-                _xml_write_tree(tree, path, default_namespace=REL_NS)
+                default_ns = nsmap.get("") if nsmap else REL_NS
+                _xml_write_tree(tree, path, default_namespace=default_ns, namespace_map=nsmap)
             for drawing_name, state in drawing_cache.items():
                 tree = state["tree"]
                 rels_tree = state["rels_tree"]
                 path = state["path"]
                 rels_path = state["rels_path"]
-                tree.write(path, encoding="utf-8", xml_declaration=True)
+                tree_nsmap = state.get("nsmap") or {"": XDR_NS}
+                _xml_write_tree(tree, path, namespace_map=tree_nsmap)
                 _xlsx_ensure_dir(os.path.dirname(rels_path))
-                _xml_write_tree(rels_tree, rels_path, default_namespace=REL_NS)
+                rels_nsmap = state.get("rels_nsmap") or {"": REL_NS}
+                default_rels_ns = rels_nsmap.get("") if rels_nsmap else REL_NS
+                _xml_write_tree(
+                    rels_tree,
+                    rels_path,
+                    default_namespace=default_rels_ns,
+                    namespace_map=rels_nsmap,
+                )
 
         # 再計算フラグ
         xlsx_force_full_recalc(tmpdir)
@@ -1745,9 +2147,83 @@ def healthz():
     # Cloud Run 起動判定用：即応答
     return {"ok": True}
 
+def _guess_office_ext_from_mime(mime: str) -> Optional[str]:
+    if not mime:
+        return None
+    mime = mime.split(";", 1)[0].strip().lower()
+    mapping = {
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+        "application/vnd.ms-word.document.macroenabled.12": ".docm",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+        "application/vnd.ms-excel.sheet.macroenabled.12": ".xlsm",
+    }
+    ext = mapping.get(mime)
+    if ext in {".docm", ".xlsm"}:
+        return ".docx" if ext == ".docm" else ".xlsx"
+    return ext
+
+
+def _sniff_office_extension(data: Optional[bytes]) -> Optional[str]:
+    if not data:
+        return None
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            names = zf.namelist()
+    except zipfile.BadZipFile:
+        return None
+    for prefix, ext in (("word/", ".docx"), ("xl/", ".xlsx")):
+        if any(name.startswith(prefix) for name in names):
+            return ext
+    return None
+
+
+def _load_template_from_data_string(text: str) -> Tuple[Optional[bytes], Optional[str]]:
+    value = (text or "").strip()
+    if not value:
+        return None, None
+    if value.startswith("data:"):
+        header, _, payload = value.partition(",")
+        if not payload:
+            return None, None
+        mime = ""
+        if header.startswith("data:"):
+            mime = header[5:]
+            if ";" in mime:
+                mime = mime.split(";", 1)[0]
+        if ";base64" in header:
+            data = _decode_base64_payload(payload)
+        else:
+            data = urllib.parse.unquote_to_bytes(payload)
+        return data, _guess_office_ext_from_mime(mime)
+    if value.startswith("base64:"):
+        _, _, payload = value.partition(":")
+        return _decode_base64_payload(payload), None
+    if value.startswith("base64,"):
+        return _decode_base64_payload(value[7:]), None
+    return None, None
+
+
+def _download_template_from_url(url: str) -> Tuple[Optional[bytes], Optional[str]]:
+    source = (url or "").strip()
+    if not source:
+        return None, None
+    try:
+        resp = requests.get(source, timeout=30)
+        resp.raise_for_status()
+    except Exception:
+        return None, None
+    data = resp.content
+    mime = resp.headers.get("Content-Type", "")
+    ext = _guess_office_ext_from_mime(mime)
+    if not ext:
+        path = urllib.parse.urlparse(source).path
+        ext = file_ext_lower(path)
+    return data, ext
+
+
 @app.post("/merge")
 async def merge(
-    file: UploadFile = File(...),
+    file: Optional[UploadFile] = File(None),
     mapping_text: str = Form(""),
     filename: str = Form("document"),
     jpeg_dpi: int = Form(150),
@@ -1755,6 +2231,8 @@ async def merge(
     return_pdf: bool = Form(True),
     return_jpegs: bool = Form(True),
     return_document: bool = Form(True),
+    file_data_uri: str = Form(""),
+    file_url: str = Form(""),
     x_auth_id: Optional[str] = Header(None, alias="X-Auth-Id"),
     authorization: Optional[str] = Header(None),
 ):
@@ -1773,21 +2251,46 @@ async def merge(
         if not validate_auth_id(auth_id):
             return err("invalid auth_id", status=401)
 
-        ext = file_ext_lower(file.filename or "")
-        if ext not in [".docx", ".xlsx"]:
+        template_bytes: Optional[bytes] = None
+        ext = ""
+        if file is not None:
+            template_bytes = await file.read()
+            ext = file_ext_lower(file.filename or "")
+
+        if (template_bytes is None or not template_bytes) and file_data_uri:
+            template_bytes, inferred_ext = _load_template_from_data_string(file_data_uri)
+            if inferred_ext and not ext:
+                ext = inferred_ext
+
+        if (template_bytes is None or not template_bytes) and file_url:
+            template_bytes, inferred_ext = _download_template_from_url(file_url)
+            if inferred_ext and not ext:
+                ext = inferred_ext
+
+        if not template_bytes:
+            return err("file must be provided via upload, data URI, or URL", 400)
+
+        sniffed_ext = _sniff_office_extension(template_bytes)
+        if sniffed_ext and ext not in {".docx", ".xlsx"}:
+            ext = sniffed_ext
+        if not ext:
+            ext = sniffed_ext or ""
+
+        if ext not in {".docx", ".xlsx"}:
             return err("file must be .docx or .xlsx", 400)
 
-        text_map, image_map = parse_mapping_text(mapping_text or "")
+        text_map, image_map, loop_map = parse_mapping_text(mapping_text or "")
 
         with tempfile.TemporaryDirectory() as td:
             src = os.path.join(td, f"src{ext}")
-            with open(src, "wb") as f: f.write(await file.read())
+            with open(src, "wb") as f:
+                f.write(template_bytes)
 
             rendered = os.path.join(td, f"rendered{ext}")
             if ext == ".docx":
-                docx_render(src, rendered, text_map, image_map)
+                docx_render(src, rendered, text_map, image_map, loop_map)
             else:
-                xlsx_patch_and_place(src, rendered, text_map, image_map)
+                xlsx_patch_and_place(src, rendered, text_map, image_map, loop_map)
 
             pdf_bytes: Optional[bytes] = None
             pdf_path: Optional[str] = None
