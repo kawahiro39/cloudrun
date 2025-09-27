@@ -1154,22 +1154,32 @@ def _xlsx_expand_loops(
             idx += 1
             continue
 
-        end_idx = idx + 1
+        end_idx = idx
         while end_idx < len(rows):
-            end_row = rows[end_idx]
-            end_found = False
-            for cell in end_row.findall("s:c", ns):
+            candidate_row = rows[end_idx]
+            has_group_token = False
+            for cell in candidate_row.findall("s:c", ns):
                 text = (_xlsx_cell_text(cell, ns, shared_strings) or "").strip()
-                if text == "#end":
-                    end_found = True
+                if not text:
+                    continue
+                if text == "#end" or _xlsx_cell_has_group_token(text, group):
+                    has_group_token = True
                     break
-            if end_found:
+            if not has_group_token and end_idx > idx:
                 break
+            if not has_group_token:
+                # The anchor row must contain the loop token; if it does not
+                # we fall back to treating it as a single-row loop block.
+                if end_idx == idx:
+                    has_group_token = True
+                else:
+                    break
             end_idx += 1
-        if end_idx >= len(rows):
-            break
 
-        block_rows = rows[idx:end_idx + 1]
+        block_rows = rows[idx:end_idx]
+        if not block_rows:
+            idx += 1
+            continue
         template_bases = [copy.deepcopy(r) for r in block_rows]
         cleaned_templates: List[ET.Element] = []
         for base in template_bases:
