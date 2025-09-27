@@ -1152,6 +1152,8 @@ def _xlsx_expand_loops(
         template_bases = [copy.deepcopy(r) for r in block_rows]
         cleaned_templates: List[ET.Element] = []
         for base in template_bases:
+            # Remove explicit "#end" markers but keep loop placeholders so that
+            # the duplicated rows stay anchored at the original start cell.
             for cell in list(base.findall("s:c", ns)):
                 cell_text = (_xlsx_cell_text(cell, ns, shared_strings) or "").strip()
                 if not cell_text:
@@ -1159,11 +1161,6 @@ def _xlsx_expand_loops(
                 if cell_text == "#end":
                     base.remove(cell)
                     continue
-                if cell_text.startswith("{") and cell_text.endswith("}"):
-                    expr = cell_text[1:-1].strip()
-                    parts = [p.strip() for p in expr.split(":") if p.strip()]
-                    if len(parts) >= 2 and parts[0] == group and parts[1] == "loop":
-                        base.remove(cell)
             if base.findall("s:c", ns):
                 cleaned_templates.append(base)
         template_bases = cleaned_templates or template_bases
