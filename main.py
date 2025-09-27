@@ -1289,7 +1289,7 @@ def _xlsx_expand_loops(
             for entry_idx, entry in enumerate(entries):
                 for tmpl in template_bases:
                     clone = copy.deepcopy(tmpl)
-                    for cell in clone.findall("s:c", ns):
+                    for cell in list(clone.findall("s:c", ns)):
                         original_text = _xlsx_cell_text(cell, ns, shared_strings)
                         if original_text is None:
                             continue
@@ -1300,7 +1300,7 @@ def _xlsx_expand_loops(
                             original_text, group, entry, text_map
                         )
                         if entry_idx > 0 and not has_group_token:
-                            cells_to_remove.append(cell)
+                            clone.remove(cell)
                             continue
                         if (
                             replaced != original_text
