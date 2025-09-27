@@ -8,18 +8,19 @@ import zipfile
 import shutil
 import subprocess
 import threading
+import asyncio
 import xml.etree.ElementTree as ET
 from decimal import Decimal
 from lxml import etree as LET
 from jinja2 import Environment, DebugUndefined
-from typing import Any, Dict, Tuple, List, Optional, Set, Mapping
+from typing import Any, Dict, Tuple, List, Optional, Set, Mapping, NamedTuple
 import urllib.parse
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, Request
 from fastapi.responses import JSONResponse
 
 _GENERIC_HTTP_SESSION_LOCAL = threading.local()
@@ -66,6 +67,40 @@ def _get_generic_http_session() -> requests.Session:
 
 app = FastAPI(title="Doc/Excel → PDF & JPEG API (stable)")
 
+
+@app.middleware("http")
+async def _authentication_middleware(request, call_next):
+    config = _load_auth_config()
+    if config.mode == "disabled":
+        return await call_next(request)
+
+    token = _extract_auth_token(request)
+    if not token:
+        if config.mode == "required":
+            return JSONResponse(status_code=401, content={"error": "Authentication required"})
+        request.state.auth_warning = "Authentication token is missing"
+        return await call_next(request)
+
+    try:
+        auth_payload = await asyncio.to_thread(_verify_auth_token, token, config)
+        if isinstance(auth_payload, Mapping):
+            sanitized = {k: v for k, v in auth_payload.items() if k != "valid"}
+            if sanitized:
+                request.state.auth_identity = sanitized
+    except AuthInvalidError as exc:
+        message = str(exc) or "Invalid authentication token"
+        if config.mode == "required":
+            return JSONResponse(status_code=401, content={"error": message})
+        request.state.auth_warning = message
+    except AuthUnavailableError as exc:
+        message = str(exc) or "Authentication service unavailable"
+        if not config.allow_on_unavailable:
+            return JSONResponse(status_code=503, content={"error": message})
+        request.state.auth_warning = message
+
+    response = await call_next(request)
+    return response
+
 # ------------ light helpers ------------
 def file_ext_lower(name: str) -> str:
     return os.path.splitext(name)[1].lower()
@@ -85,20 +120,126 @@ def run(cmd: List[str], cwd: Optional[str] = None):
         )
     return proc
 
-def ok(d): return JSONResponse(status_code=200, content=d)
-def err(message, status=400):
+def ok(d: Mapping, request: Optional[Request] = None) -> JSONResponse:
+    payload = dict(d)
+    diagnostics = _build_diagnostics(request)
+    if diagnostics:
+        existing = payload.get("diagnostics")
+        if isinstance(existing, dict):
+            diagnostics = {**existing, **diagnostics}
+        payload["diagnostics"] = diagnostics
+    return JSONResponse(status_code=200, content=payload)
+
+
+def err(message, status: int = 400, request: Optional[Request] = None) -> JSONResponse:
     if isinstance(message, Mapping):
         payload = dict(message)
         if "error" not in payload:
             payload["error"] = str(payload.get("message", "")) or "Unknown error"
-        return JSONResponse(status_code=status, content=payload)
-    return JSONResponse(status_code=status, content={"error": str(message)})
+    else:
+        payload = {"error": str(message)}
+    diagnostics = _build_diagnostics(request)
+    if diagnostics:
+        existing = payload.get("diagnostics")
+        if isinstance(existing, dict):
+            diagnostics = {**existing, **diagnostics}
+        payload["diagnostics"] = diagnostics
+    return JSONResponse(status_code=status, content=payload)
 
 def _generic_http_timeout() -> float:
     try:
         return float(os.environ.get("HTTP_REQUEST_TIMEOUT", "20"))
     except ValueError:
         return 20.0
+
+
+def _truthy(value: Optional[str]) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+class AuthError(Exception):
+    """Base class for authentication failures."""
+
+
+class AuthInvalidError(AuthError):
+    """Raised when a supplied credential is invalid."""
+
+
+class AuthUnavailableError(AuthError):
+    """Raised when the upstream verifier cannot be reached."""
+
+
+class AuthConfig(NamedTuple):
+    mode: str
+    verify_url: str
+    allow_on_unavailable: bool
+
+
+def _load_auth_config() -> AuthConfig:
+    mode = (os.environ.get("AUTH_MODE", "disabled") or "disabled").strip().lower()
+    if mode not in {"disabled", "optional", "required"}:
+        mode = "disabled"
+    verify_url = (os.environ.get("AUTH_API_BASE_URL", "").strip())
+    allow_on_unavailable = _truthy(os.environ.get("AUTH_ALLOW_ON_UNAVAILABLE", "true"))
+    return AuthConfig(mode=mode, verify_url=verify_url, allow_on_unavailable=allow_on_unavailable)
+
+
+def _extract_auth_token(request: Request) -> Optional[str]:
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        token = auth_header[7:].strip()
+        if token:
+            return token
+    header_token = request.headers.get("X-Auth-Id", "").strip()
+    return header_token or None
+
+
+def _verify_auth_token(token: str, config: AuthConfig) -> Dict[str, Any]:
+    if not config.verify_url:
+        raise AuthUnavailableError("AUTH_API_BASE_URL is not configured")
+    session = _get_generic_http_session()
+    try:
+        resp = session.post(
+            config.verify_url,
+            json={"token": token},
+            timeout=_generic_http_timeout(),
+        )
+    except requests.RequestException as exc:
+        raise AuthUnavailableError(str(exc)) from exc
+
+    if resp.status_code in {200, 204}:
+        data: Dict[str, Any]
+        if resp.content:
+            try:
+                data = resp.json()
+            except ValueError:
+                data = {}
+        else:
+            data = {}
+        if data.get("valid") is False:
+            raise AuthInvalidError(data.get("message") or "Invalid authentication token")
+        return data
+
+    if resp.status_code in {401, 403}:
+        raise AuthInvalidError("Invalid authentication token")
+
+    if 400 <= resp.status_code < 500:
+        raise AuthInvalidError(f"Authentication failed ({resp.status_code})")
+
+    raise AuthUnavailableError(f"Authentication service returned {resp.status_code}")
+
+
+def _build_diagnostics(request: Optional[Request]) -> Dict[str, Any]:
+    diagnostics: Dict[str, Any] = {}
+    if request is None:
+        return diagnostics
+    warning = getattr(request.state, "auth_warning", None)
+    if warning:
+        diagnostics["auth_warning"] = warning
+    identity = getattr(request.state, "auth_identity", None)
+    if identity:
+        diagnostics["auth_identity"] = identity
+    return diagnostics
 
 
 # ------------ tag & number parsing ------------
@@ -472,6 +613,32 @@ def _word_set_text(node: LET._Element, text: str):
         t.text = part
         run.append(t)
 
+
+VERTICAL_TEXT_DIRECTIONS = {
+    "tbRl",
+    "tbRlV",
+    "btLr",
+    "btLrV",
+    "lrTbV",
+    "tbRl90",
+    "btLr90",
+}
+
+
+def _word_node_is_vertical(node: Optional[LET._Element]) -> bool:
+    current = node
+    while current is not None:
+        if current.tag == f"{{{W_NS}}}tc":
+            tc_pr = current.find(f"{{{W_NS}}}tcPr")
+            if tc_pr is not None:
+                text_dir = tc_pr.find(f"{{{W_NS}}}textDirection")
+                if text_dir is not None:
+                    value = text_dir.get(f"{{{W_NS}}}val") or text_dir.get("val")
+                    if value in VERTICAL_TEXT_DIRECTIONS:
+                        return True
+        current = current.getparent()
+    return False
+
 def _word_snapshot(root) -> Tuple[List[Tuple[LET._Element, int, int]], str]:
     nodes: List[Tuple[LET._Element, int, int]] = []
     cursor = 0
@@ -512,6 +679,7 @@ def _word_convert_placeholders(
     root,
     size_hints: Dict[str, Optional[float]],
     loop_map: Dict[str, List[Dict[str, str]]],
+    layout_hints: Dict[str, Dict[str, object]],
 ):
     nodes, full_text = _word_snapshot(root)
     if not nodes:
@@ -542,6 +710,12 @@ def _word_convert_placeholders(
 
     pieces: List[str] = []
     pos = 0
+
+    def _node_for_index(index: int) -> Optional[LET._Element]:
+        for node, start_idx, end_idx in nodes:
+            if start_idx <= index < end_idx:
+                return node
+        return None
 
     while pos < len(full_text):
         next_placeholder = WORD_INLINE_PATTERN.search(full_text, pos)
@@ -574,6 +748,8 @@ def _word_convert_placeholders(
         expr_clean = expr.strip()
         parts = [p.strip() for p in expr_clean.split(":") if p.strip()]
         replacement = next_placeholder.group(0)
+        context_node = _node_for_index(next_placeholder.start())
+        is_vertical = _word_node_is_vertical(context_node)
 
         if parts:
             group = parts[0]
@@ -609,6 +785,9 @@ def _word_convert_placeholders(
                         replacement = f"{{{{ {var_name} }}}}"
                 else:
                     replacement = f"{{{{ {expr_clean} }}}}"
+                    if is_vertical and len(parts) == 1:
+                        layout = layout_hints.setdefault(expr_clean, {})
+                        layout.setdefault("vertical_text", True)
 
         pieces.append(replacement)
         pos = next_placeholder.end()
@@ -738,10 +917,11 @@ def docx_convert_tags_to_jinja(
     in_docx: str,
     out_docx: str,
     loop_map: Optional[Dict[str, List[Dict[str, str]]]] = None,
-) -> Dict[str, Optional[float]]:
+) -> Tuple[Dict[str, Optional[float]], Dict[str, Dict[str, object]]]:
     # {var}/{[var]} → {{ var }} へ。英数字+下線のタグのみ変換（Jinja誤爆防止）
     tmpdir = tempfile.mkdtemp()
     size_hints: Dict[str, Optional[float]] = {}
+    layout_hints: Dict[str, Dict[str, object]] = {}
     try:
         with zipfile.ZipFile(in_docx, 'r') as zin:
             zin.extractall(tmpdir)
@@ -749,7 +929,7 @@ def docx_convert_tags_to_jinja(
             parser = LET.XMLParser(remove_blank_text=False)
             tree = LET.parse(p, parser)
             root = tree.getroot()
-            _word_convert_placeholders(root, size_hints, loop_map or {})
+            _word_convert_placeholders(root, size_hints, loop_map or {}, layout_hints)
             tree.write(p, encoding="utf-8", xml_declaration=True)
 
         with zipfile.ZipFile(out_docx, 'w', zipfile.ZIP_DEFLATED) as zout:
@@ -759,7 +939,7 @@ def docx_convert_tags_to_jinja(
                     zout.write(full, os.path.relpath(full, tmpdir))
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
-    return size_hints
+    return size_hints, layout_hints
 
 def _word_replace_placeholder_with_drawing(root, nodes: List[Tuple[LET._Element, int, int]], start: int, end: int, drawing: LET._Element) -> bool:
 
@@ -931,7 +1111,17 @@ def docx_render(
     tmp = in_docx + ".jinja.docx"
     resolved_loops: Dict[str, List[Dict[str, str]]] = loop_map or {}
 
-    size_hints = docx_convert_tags_to_jinja(in_docx, tmp, resolved_loops)
+    size_hints, layout_hints = docx_convert_tags_to_jinja(in_docx, tmp, resolved_loops)
+
+    normalized_text_map: Dict[str, str] = {}
+    for key, value in text_map.items():
+        new_value = value
+        hint = layout_hints.get(key)
+        if hint and hint.get("vertical_text") and isinstance(value, str):
+            if value and "\n" not in value:
+                new_value = "\n".join(list(value))
+        normalized_text_map[key] = new_value
+    text_map = normalized_text_map
 
     doc = DocxTemplate(tmp)
     ctx: Dict[str, object] = {}
@@ -2270,6 +2460,7 @@ def _download_template_from_url(url: str) -> Tuple[Optional[bytes], Optional[str
 
 @app.post("/merge")
 async def merge(
+    request: Request,
     file: Optional[UploadFile] = File(None),
     mapping_text: str = Form(""),
     filename: str = Form("document"),
@@ -2301,7 +2492,7 @@ async def merge(
                 ext = inferred_ext
 
         if not template_bytes:
-            return err("file must be provided via upload, data URI, or URL", 400)
+            return err("file must be provided via upload, data URI, or URL", 400, request=request)
 
         sniffed_ext = _sniff_office_extension(template_bytes)
         if sniffed_ext and ext not in {".docx", ".xlsx"}:
@@ -2310,7 +2501,7 @@ async def merge(
             ext = sniffed_ext or ""
 
         if ext not in {".docx", ".xlsx"}:
-            return err("file must be .docx or .xlsx", 400)
+            return err("file must be .docx or .xlsx", 400, request=request)
 
         text_map, image_map, loop_map = parse_mapping_text(mapping_text or "")
 
@@ -2378,10 +2569,10 @@ async def merge(
             if not response:
                 response["message"] = "No outputs requested"
 
-            return ok(response)
+            return ok(response, request=request)
     except Exception as e:
         # 500 ではなく 400 を返す（Bubble 側で原因が見える）
-        return err(str(e), 400)
+        return err(str(e), 400, request=request)
 
 if __name__ == "__main__":
     import uvicorn
