@@ -1243,11 +1243,16 @@ def _xlsx_expand_loops(
             candidate_row = rows[legacy_end_idx]
             has_group_token = False
             for cell in candidate_row.findall("s:c", ns):
-                text = (_xlsx_cell_text(cell, ns, shared_strings) or "").strip()
+                raw_text = _xlsx_cell_text(cell, ns, shared_strings) or ""
+                text = raw_text.strip()
                 if not text:
                     continue
-                if text == "#end" or _xlsx_cell_has_loop_token(text, group):
-                    has_group_token = True
+                if text == "#end":
+                    if not re.fullmatch(r"\s*#end\s*", raw_text):
+                        raise ValueError(
+                            f"Loop end marker for '{group}' must be '#end' only"
+                        )
+                    found_end = True
                     break
             if not has_group_token:
                 if legacy_end_idx == idx:
@@ -1279,6 +1284,7 @@ def _xlsx_expand_loops(
 
         entries = loop_map.get(group, [])
         insert_pos = idx
+
         if entries:
             for entry_idx, entry in enumerate(entries):
                 for tmpl in template_bases:
@@ -1307,7 +1313,7 @@ def _xlsx_expand_loops(
                         insert_pos += 1
 
         rows = list(sheet_data.findall("s:row", ns))
-        idx = insert_pos if entries else idx
+        idx = insert_pos
 
     _xlsx_reindex_rows(sheet_data, ns)
 
