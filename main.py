@@ -1,6 +1,7 @@
 import os
 import re
 import io
+import copy
 import base64
 import binascii
 import tempfile
@@ -97,11 +98,13 @@ def validate_auth_id(auth_id: str) -> bool:
 
 # ------------ tag & number parsing ------------
 VAR_NAME = r"[A-Za-z_][A-Za-z0-9_]*"
+VAR_PATH = r"[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*"
 IMG_KEY_PATTERN = re.compile(rf"^\{{\[(?P<var>{VAR_NAME})\](?::(?P<size>[^}}]+))?\}}$")
 TXT_KEY_PATTERN = re.compile(rf"^\{{(?P<var>{VAR_NAME})\}}$")
+LOOP_KEY_PATTERN = re.compile(rf"^\{{(?P<group>{VAR_NAME}):loop:(?P<field>{VAR_NAME})\}}$")
 IMG_TAG_PATTERN = re.compile(rf"\{{\[(?P<var>{VAR_NAME})\](?::(?P<size>[^}}]+))?\}}")
 WORD_INLINE_PATTERN = re.compile(
-    rf"(?<!\{{)\{{\s*(?:\[\s*(?P<img>{VAR_NAME})\s*\](?::(?P<size>[^}}]+))?|(?P<txt>{VAR_NAME}))\s*\}}(?!\}})"
+    rf"(?<!\{{)\{{\s*(?:\[\s*(?P<img>{VAR_NAME})\s*\](?::(?P<size>[^}}]+))?|(?P<txt>{VAR_PATH}))\s*\}}(?!\}})"
 )
 MM_RE      = re.compile(r'^\s*(\d+(?:\.\d+)?)\s*mm\s*$', re.IGNORECASE)
 NUM_PLAIN  = re.compile(r'^\s*-?\d+(?:\.\d+)?\s*$')
@@ -161,14 +164,15 @@ def _format_formula_value(value) -> Tuple[Optional[str], Optional[str]]:
 def _with_newlines(v: str) -> str:
     return (v or "").replace("<br>", "\n")
 
-def parse_mapping_text(raw: str) -> Tuple[Dict[str, str], Dict[str, Dict]]:
+def parse_mapping_text(raw: str) -> Tuple[Dict[str, str], Dict[str, Dict], Dict[str, List[Dict[str, str]]]]:
     """
     {a}:X,{b}:Y でも 改行でもOK。URL内カンマ保護。
     {[img]:50mm}:URL / {[img]}:URL
     """
     text_map: Dict[str, str] = {}
     image_map: Dict[str, Dict] = {}
-    if not raw: return text_map, image_map
+    loop_map: Dict[str, List[Dict[str, str]]] = {}
+    if not raw: return text_map, image_map, loop_map
 
     SAFE = "\u241B"  # protect ://
     protected = [line.replace("://", SAFE) for line in raw.splitlines()]
@@ -181,6 +185,8 @@ def parse_mapping_text(raw: str) -> Tuple[Dict[str, str], Dict[str, Dict]]:
             seg = seg.strip()
             if seg: items.append(seg.replace(SAFE, "://"))
 
+    loop_values: Dict[str, Dict[str, List[str]]] = {}
+
     for seg in items:
         if "}" not in seg:
             continue
@@ -190,16 +196,40 @@ def parse_mapping_text(raw: str) -> Tuple[Dict[str, str], Dict[str, Dict]]:
         if not key:
             continue
 
+        value_processed = _with_newlines(value)
+
         m_img = IMG_KEY_PATTERN.match(key)
         if m_img:
             v = m_img.group("var"); mm = parse_size_mm(m_img.group("size") or "")
             image_map[v] = {"url": value, "mm": mm}; continue
 
+        m_loop = LOOP_KEY_PATTERN.match(key)
+        if m_loop:
+            group = m_loop.group("group")
+            field = m_loop.group("field")
+            segments = value_processed.splitlines() or [""]
+            store = loop_values.setdefault(group, {}).setdefault(field, [])
+            store.extend(segments)
+            continue
+
         m_txt = TXT_KEY_PATTERN.match(key)
         if m_txt:
-            v = m_txt.group("var"); text_map[v] = _with_newlines(value); continue
+            v = m_txt.group("var"); text_map[v] = value_processed; continue
 
-    return text_map, image_map
+    for group, fields in loop_values.items():
+        lengths = [len(vals) for vals in fields.values() if vals]
+        max_len = max(lengths) if lengths else 0
+        rows: List[Dict[str, str]] = []
+        for idx in range(max_len):
+            row: Dict[str, str] = {}
+            for field, vals in fields.items():
+                row[field] = vals[idx] if idx < len(vals) else ""
+            if row:
+                rows.append(row)
+        if rows:
+            loop_map[group] = rows
+
+    return text_map, image_map, loop_map
 
 def _apply_text_tokens(text: Optional[str], text_map: Dict[str, str]) -> Optional[str]:
     if text is None or not text_map:
@@ -467,7 +497,45 @@ def _word_splice_text(nodes: List[Tuple[LET._Element, int, int]], start: int, en
             else:
                 node.text = remainder
 
-def _word_convert_placeholders(root, size_hints: Dict[str, Optional[float]]):
+def _word_convert_placeholders(
+    root,
+    size_hints: Dict[str, Optional[float]],
+    loop_map: Dict[str, List[Dict[str, str]]],
+):
+    loop_vars: Dict[str, str] = {}
+    loop_counter = [0]
+
+    def _loop_var(group: str) -> str:
+        if group not in loop_vars:
+            loop_counter[0] += 1
+            loop_vars[group] = f"__loop_{loop_counter[0]}_{group}"
+        return loop_vars[group]
+
+    def _placeholder_to_jinja(expr: str) -> str:
+        expr_clean = (expr or "").strip()
+        if not expr_clean:
+            return ""
+        parts = [p.strip() for p in expr_clean.split(":") if p.strip()]
+        if not parts:
+            return ""
+        if len(parts) >= 2 and parts[1] == "loop":
+            group = parts[0]
+            var_name = _loop_var(group)
+            if len(parts) == 2:
+                return f"{{% for {var_name} in loops.get('{group}', []) %}}"
+            field = parts[2] if len(parts) > 2 else ""
+            if not field:
+                return ""
+            return f"{{{{ {var_name}.get('{field}', '') }}}}"
+        group = parts[0]
+        if group in loop_vars or group in loop_map:
+            var_name = _loop_var(group)
+            field = parts[1] if len(parts) > 1 else ""
+            if not field:
+                return f"{{{{ {var_name} }}}}"
+            return f"{{{{ {var_name}.get('{field}', '') }}}}"
+        return f"{{{{ {expr_clean} }}}}"
+
     while True:
         nodes, full_text = _word_snapshot(root)
         if not nodes:
@@ -482,7 +550,17 @@ def _word_convert_placeholders(root, size_hints: Dict[str, Optional[float]]):
             size = parse_size_mm(match.group("size") or "")
             if size is not None:
                 size_hints.setdefault(var, size)
-        _word_splice_text(nodes, match.start(), match.end(), f"{{{{ {var} }}}}")
+        replacement = _placeholder_to_jinja(match.group("txt")) if match.group("txt") else f"{{{{ {var} }}}}"
+        _word_splice_text(nodes, match.start(), match.end(), replacement)
+
+    while True:
+        nodes, full_text = _word_snapshot(root)
+        if not nodes:
+            break
+        idx = full_text.find("#end")
+        if idx == -1:
+            break
+        _word_splice_text(nodes, idx, idx + 4, "{% endfor %}")
 
 WORD_JINJA_PATTERN = re.compile(r"\{\{\s*(?P<var>%s)\s*\}\}" % VAR_NAME)
 
@@ -598,7 +676,11 @@ def _word_content_xmls(extracted_dir: str) -> List[str]:
             if fn.startswith("footer") and fn.endswith(".xml"): targets.append(f"word/{fn}")
     return [os.path.join(extracted_dir, p) for p in targets if os.path.exists(os.path.join(extracted_dir, p))]
 
-def docx_convert_tags_to_jinja(in_docx: str, out_docx: str) -> Dict[str, Optional[float]]:
+def docx_convert_tags_to_jinja(
+    in_docx: str,
+    out_docx: str,
+    loop_map: Optional[Dict[str, List[Dict[str, str]]]] = None,
+) -> Dict[str, Optional[float]]:
     # {var}/{[var]} → {{ var }} へ。英数字+下線のタグのみ変換（Jinja誤爆防止）
     tmpdir = tempfile.mkdtemp()
     size_hints: Dict[str, Optional[float]] = {}
@@ -609,7 +691,7 @@ def docx_convert_tags_to_jinja(in_docx: str, out_docx: str) -> Dict[str, Optiona
             parser = LET.XMLParser(remove_blank_text=False)
             tree = LET.parse(p, parser)
             root = tree.getroot()
-            _word_convert_placeholders(root, size_hints)
+            _word_convert_placeholders(root, size_hints, loop_map or {})
             tree.write(p, encoding="utf-8", xml_declaration=True)
 
         with zipfile.ZipFile(out_docx, 'w', zipfile.ZIP_DEFLATED) as zout:
@@ -778,17 +860,26 @@ def _word_postprocess_docx(docx_path: str, text_map: Dict[str, str], assets: Dic
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-def docx_render(in_docx: str, out_docx: str, text_map: Dict[str, str], image_map: Dict[str, Dict]):
+def docx_render(
+    in_docx: str,
+    out_docx: str,
+    text_map: Dict[str, str],
+    image_map: Dict[str, Dict],
+    loop_map: Optional[Dict[str, List[Dict[str, str]]]] = None,
+):
     from docxtpl import DocxTemplate, InlineImage
     from docx.shared import Mm
 
     tmp = in_docx + ".jinja.docx"
-    size_hints = docx_convert_tags_to_jinja(in_docx, tmp)
+    resolved_loops: Dict[str, List[Dict[str, str]]] = loop_map or {}
+
+    size_hints = docx_convert_tags_to_jinja(in_docx, tmp, resolved_loops)
 
     doc = DocxTemplate(tmp)
     ctx: Dict[str, object] = {}
     for k, v in text_map.items():
         ctx[k] = v
+    ctx.setdefault("loops", resolved_loops)
     image_blobs: Dict[str, Dict[str, Optional[float]]] = {}
     for k, meta in image_map.items():
         r = requests.get(meta["url"], timeout=20); r.raise_for_status()
@@ -934,6 +1025,170 @@ def _xlsx_set_anchor_size(anchor_el: Optional[ET.Element], cx: int, cy: int):
             ext_el = ET.SubElement(anchor_el, f"{{{XDR_NS}}}ext")
         ext_el.set("cx", str(cx))
         ext_el.set("cy", str(cy))
+
+
+def _xlsx_cell_text(
+    cell: ET.Element,
+    ns: Dict[str, str],
+    shared_strings: List[str],
+) -> str:
+    t_attr = cell.get("t")
+    if t_attr == "s":
+        v_node = cell.find("s:v", ns)
+        if v_node is None or v_node.text is None:
+            return ""
+        try:
+            idx = int(v_node.text)
+        except (TypeError, ValueError):
+            return ""
+        if 0 <= idx < len(shared_strings):
+            return shared_strings[idx] or ""
+        return ""
+    if t_attr == "inlineStr":
+        parts: List[str] = []
+        for t_node in cell.findall("s:is/s:t", ns):
+            parts.append(t_node.text or "")
+        return "".join(parts)
+    v_node = cell.find("s:v", ns)
+    if v_node is not None and v_node.text is not None:
+        return v_node.text
+    return ""
+
+
+def _xlsx_set_inline_text(cell: ET.Element, ns: Dict[str, str], text: str):
+    for child in list(cell):
+        if child.tag == f"{{{S_NS}}}f":
+            continue
+        cell.remove(child)
+    cell.set("t", "inlineStr")
+    is_node = ET.SubElement(cell, f"{{{S_NS}}}is")
+    t_node = ET.SubElement(is_node, f"{{{S_NS}}}t")
+    if text and (text.strip() != text or "\n" in text):
+        t_node.set(f"{{{XML_NS}}}space", "preserve")
+    t_node.text = text or ""
+
+
+def _xlsx_apply_loop_text(
+    text: str,
+    group: str,
+    entry: Dict[str, str],
+    text_map: Dict[str, str],
+) -> str:
+    result = text.replace(f"{{{group}:loop}}", "")
+    result = result.replace("#end", "")
+    for field, value in entry.items():
+        for token in (
+            f"{{{group}:{field}}}",
+            f"{{{group}:loop:{field}}}",
+        ):
+            result = result.replace(token, value or "")
+    result = _apply_text_tokens(result, text_map)
+    return result
+
+
+def _xlsx_reindex_rows(sheet_data: ET.Element, ns: Dict[str, str]):
+    for row_idx, row_el in enumerate(sheet_data.findall("s:row", ns), start=1):
+        row_el.set("r", str(row_idx))
+        for cell in row_el.findall("s:c", ns):
+            ref = cell.get("r")
+            if not ref:
+                continue
+            m = CELL_REF_RE.match(ref)
+            if not m:
+                continue
+            col_letters = m.group(1)
+            cell.set("r", f"{col_letters}{row_idx}")
+
+
+def _xlsx_expand_loops(
+    sheet_root: ET.Element,
+    shared_strings: List[str],
+    loop_map: Dict[str, List[Dict[str, str]]],
+    text_map: Dict[str, str],
+):
+    if not loop_map:
+        return
+
+    ns = {"s": S_NS}
+    sheet_data = sheet_root.find("s:sheetData", ns)
+    if sheet_data is None:
+        return
+
+    rows = list(sheet_data.findall("s:row", ns))
+    idx = 0
+    while idx < len(rows):
+        row = rows[idx]
+        group: Optional[str] = None
+        for cell in row.findall("s:c", ns):
+            text = (_xlsx_cell_text(cell, ns, shared_strings) or "").strip()
+            if not text:
+                continue
+            if text.startswith("{") and text.endswith("}"):
+                expr = text[1:-1].strip()
+                parts = [p.strip() for p in expr.split(":") if p.strip()]
+                if len(parts) >= 2 and parts[1] == "loop":
+                    group = parts[0]
+                    break
+        if not group:
+            idx += 1
+            continue
+
+        end_idx = idx + 1
+        while end_idx < len(rows):
+            end_row = rows[end_idx]
+            end_found = False
+            for cell in end_row.findall("s:c", ns):
+                text = (_xlsx_cell_text(cell, ns, shared_strings) or "").strip()
+                if text == "#end":
+                    end_found = True
+                    break
+            if end_found:
+                break
+            end_idx += 1
+        if end_idx >= len(rows):
+            break
+
+        block_rows = rows[idx:end_idx + 1]
+        template_bases = [copy.deepcopy(r) for r in block_rows]
+        cleaned_templates: List[ET.Element] = []
+        for base in template_bases:
+            for cell in list(base.findall("s:c", ns)):
+                cell_text = (_xlsx_cell_text(cell, ns, shared_strings) or "").strip()
+                if not cell_text:
+                    continue
+                if cell_text == "#end":
+                    base.remove(cell)
+                    continue
+                if cell_text.startswith("{") and cell_text.endswith("}"):
+                    expr = cell_text[1:-1].strip()
+                    parts = [p.strip() for p in expr.split(":") if p.strip()]
+                    if len(parts) >= 2 and parts[0] == group and parts[1] == "loop":
+                        base.remove(cell)
+            if base.findall("s:c", ns):
+                cleaned_templates.append(base)
+        template_bases = cleaned_templates or template_bases
+        for original in block_rows:
+            sheet_data.remove(original)
+
+        entries = loop_map.get(group, [])
+        insert_pos = idx
+        if entries:
+            for entry in entries:
+                for tmpl in template_bases:
+                    clone = copy.deepcopy(tmpl)
+                    for cell in clone.findall("s:c", ns):
+                        original_text = _xlsx_cell_text(cell, ns, shared_strings)
+                        if original_text is None:
+                            continue
+                        replaced = _xlsx_apply_loop_text(original_text, group, entry, text_map)
+                        if replaced != original_text or f"{{{group}:" in original_text or "#end" in original_text:
+                            _xlsx_set_inline_text(cell, ns, replaced)
+                    sheet_data.insert(insert_pos, clone)
+                    insert_pos += 1
+        rows = list(sheet_data.findall("s:row", ns))
+        idx = insert_pos if entries else idx
+
+    _xlsx_reindex_rows(sheet_data, ns)
 
 
 def _decode_base64_payload(payload: str) -> Optional[bytes]:
@@ -1267,7 +1522,13 @@ def xlsx_update_formula_caches(xlsx_path: str, formula_cells: List[Dict]):
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str], image_map: Dict[str, Dict]):
+def xlsx_patch_and_place(
+    src_xlsx: str,
+    dst_xlsx: str,
+    text_map: Dict[str, str],
+    image_map: Dict[str, Dict],
+    loop_map: Optional[Dict[str, List[Dict[str, str]]]] = None,
+):
     """
     1) XML直編集で {var} を置換（完全一致は数値化、<br>→\n）、{[img]} はセルから除去し placements に記録
     2) drawing XML を直接編集して placements に新規画像挿入（既存図形/グラフは維持）
@@ -1278,6 +1539,9 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
     placements: List[Dict[str, object]] = []
     formula_cells: List[Dict[str, object]] = []
     sheet_drawings: Dict[str, List[Dict[str, object]]] = {}
+    shared_strings_values: List[str] = []
+    resolved_loops = loop_map or {}
+
     try:
         with zipfile.ZipFile(src_xlsx, 'r') as zin:
             zin.extractall(tmpdir)
@@ -1304,6 +1568,7 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                     img_sst_idx[idx] = (var, size_hint)
                     for r in list(si): si.remove(r)
                     t = ET.SubElement(si, f"{{{ns['s']}}}t"); t.text = ""
+                    shared_strings_values.append("")
                     continue
 
                 # テキスト置換
@@ -1312,6 +1577,7 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                 # 書き戻し
                 for r in list(si): si.remove(r)
                 t = ET.SubElement(si, f"{{{ns['s']}}}t"); t.text = replaced
+                shared_strings_values.append(replaced or "")
 
                 # 完全一致 = 数値候補
                 txt_match = TXT_KEY_PATTERN.match(original or "")
@@ -1333,6 +1599,9 @@ def xlsx_patch_and_place(src_xlsx: str, dst_xlsx: str, text_map: Dict[str, str],
                 p = os.path.join(ws_dir, fn)
                 tree, sheet_nsmap = _xml_parse_tree(p)
                 root = tree.getroot()
+
+                if resolved_loops:
+                    _xlsx_expand_loops(root, shared_strings_values, resolved_loops, text_map)
 
                 sheet_name, sheet_index = sheet_map.get(fn, (None, None))
                 if sheet_index is None:
@@ -1910,7 +2179,7 @@ async def merge(
         if ext not in [".docx", ".xlsx"]:
             return err("file must be .docx or .xlsx", 400)
 
-        text_map, image_map = parse_mapping_text(mapping_text or "")
+        text_map, image_map, loop_map = parse_mapping_text(mapping_text or "")
 
         with tempfile.TemporaryDirectory() as td:
             src = os.path.join(td, f"src{ext}")
@@ -1918,9 +2187,9 @@ async def merge(
 
             rendered = os.path.join(td, f"rendered{ext}")
             if ext == ".docx":
-                docx_render(src, rendered, text_map, image_map)
+                docx_render(src, rendered, text_map, image_map, loop_map)
             else:
-                xlsx_patch_and_place(src, rendered, text_map, image_map)
+                xlsx_patch_and_place(src, rendered, text_map, image_map, loop_map)
 
             pdf_bytes: Optional[bytes] = None
             pdf_path: Optional[str] = None
