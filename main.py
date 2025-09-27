@@ -24,7 +24,6 @@ from fastapi.responses import JSONResponse
 
 _GENERIC_HTTP_SESSION_LOCAL = threading.local()
 
-
 def _build_retry(
     total: int,
     connect: int,
@@ -94,7 +93,6 @@ def err(message, status=400):
             payload["error"] = str(payload.get("message", "")) or "Unknown error"
         return JSONResponse(status_code=status, content=payload)
     return JSONResponse(status_code=status, content={"error": str(message)})
-
 
 def _generic_http_timeout() -> float:
     try:

@@ -39,6 +39,16 @@ The server exposes a health check at `GET /healthz` and the main processing endp
 | `return_document` | form-data | bool | When `true`, include the patched `.docx`/`.xlsx` data URI |
 Provide the Office template either as a multipart file upload (`file`), a data URI/Base64 string (`file_data_uri`), or a downloadable URL (`file_url`). Only one source is required. Responses are JSON. Depending on the selected flags the payload can contain `pdf_data_uri`, `jpeg_data_uris`, and/or `document_data_uri` entries. All binary payloads are returned as data URIs with appropriate MIME types.
 
+### Authentication
+
+Authentication is configurable via the `AUTH_MODE` environment variable:
+
+* `disabled` (default) — no authentication is enforced.
+* `optional` — the service attempts to validate the supplied token but continues when it is missing or invalid; warnings are surfaced in the `diagnostics.auth_warning` field.
+* `required` — requests without a valid token receive `401` responses.
+
+Tokens can be supplied via the `X-Auth-Id` header or `Authorization: Bearer <token>`. When validation is enabled the service contacts the external verifier configured by `AUTH_API_BASE_URL` (defaulting to the production endpoint). If the verifier is unavailable and `AUTH_ALLOW_ON_UNAVAILABLE` is `true` (the default) the request proceeds with a warning instead of failing with `503`.
+
 ### Placeholder syntax
 
 * Text placeholders: `{customer_name}`
