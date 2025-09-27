@@ -45,6 +45,7 @@ Responses are JSON. Depending on the selected flags the payload can contain `pdf
 * Text placeholders: `{customer_name}`
 * Numeric-friendly placeholders: when the replacement text is a pure number or percentage the value is written as a number in Excel cells.
 * Image placeholders: `{[logo]}` or `{[logo:40mm]}`. The optional size is applied to the image width.
+* Loop placeholders (Word and Excel): wrap the repeated block with `{group:loop}` … `#end` and reference loop fields inside the block as `{group:loop:field}`.
 
 `mapping_text` accepts comma- or newline-separated pairs:
 
@@ -52,7 +53,13 @@ Responses are JSON. Depending on the selected flags the payload can contain `pdf
 {customer_name}:Alice Example
 {order_total}:12,345
 {[logo]}:https://example.com/logo.png
+{items:loop:item}:Widget A
+{items:loop:price}:1000
+{items:loop:item}:Widget B
+{items:loop:price}:2500
 ```
+
+Loop entries can be listed multiple times per field. The service groups entries that share the same loop name (`items` in the example above) and feeds them to templates in row order. In Word templates the section between `{items:loop}` and `#end` repeats for every row, while Excel templates duplicate the rows enclosed by the same markers. Fields missing values in a particular row default to empty strings.
 
 You can also inline newline substitutions using `<br>` inside the replacement text.
 
