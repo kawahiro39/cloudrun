@@ -9,6 +9,7 @@ This project exposes a FastAPI application that patches Word (`.docx`) or Excel 
   * `soffice` (LibreOffice) for Office → PDF conversion
   * `pdftoppm` for PDF → JPEG conversion
 * The services that call this API must pass a valid `auth_id`. The server validates this token against `AUTH_API_BASE_URL` (defaults to the production endpoint in `main.py`).
+  * If the upstream auth service is unavailable you can allow requests to proceed by leaving `AUTH_ALLOW_ON_UNAVAILABLE` at its default of `true`. Set it to `false` to preserve the strict 503 failure mode.
 
 Install Python dependencies:
 

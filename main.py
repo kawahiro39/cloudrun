@@ -84,6 +84,10 @@ def _auth_api_timeout() -> float:
         return 5.0
 
 
+def _auth_soft_fail_enabled() -> bool:
+    return (os.environ.get("AUTH_ALLOW_ON_UNAVAILABLE", "true").lower() in {"1", "true", "yes", "on"})
+
+
 def validate_auth_id(auth_id: str) -> bool:
     base_url = (os.environ.get("AUTH_API_BASE_URL") or DEFAULT_AUTH_API_BASE_URL or "").rstrip("/")
     if not base_url:
@@ -2468,11 +2472,15 @@ async def merge(
         if not auth_id:
             return err("missing auth_id", status=401)
 
+        auth_warning: Optional[str] = None
         try:
             if not validate_auth_id(auth_id):
                 return err("invalid auth_id", status=401)
         except AuthServiceUnavailable as exc:
-            return err(str(exc), status=503)
+            if _auth_soft_fail_enabled():
+                auth_warning = str(exc)
+            else:
+                return err(str(exc), status=503)
 
         template_bytes: Optional[bytes] = None
         ext = ""
@@ -2567,6 +2575,9 @@ async def merge(
 
             if not response:
                 response["message"] = "No outputs requested"
+
+            if auth_warning:
+                response.setdefault("warnings", []).append(auth_warning)
 
             return ok(response)
     except Exception as e:
