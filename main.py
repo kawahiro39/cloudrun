@@ -9,6 +9,7 @@ import zipfile
 import shutil
 import subprocess
 import threading
+import time
 import xml.etree.ElementTree as ET
 from decimal import Decimal
 from lxml import etree as LET
@@ -26,30 +27,68 @@ from fastapi.responses import JSONResponse
 DEFAULT_AUTH_API_BASE_URL = "https://auth-677366504119.asia-northeast1.run.app"
 
 _AUTH_SESSION_LOCAL = threading.local()
+_AUTH_CACHE_LOCK = threading.Lock()
+_AUTH_CACHE: Dict[str, Tuple[float, bool]] = {}
+_GENERIC_HTTP_SESSION_LOCAL = threading.local()
 
 
 class AuthServiceUnavailable(RuntimeError):
     """Raised when the external auth validation service is unavailable."""
 
 
+def _build_retry(
+    total: int,
+    connect: int,
+    read: int,
+    status: int,
+    backoff_factor: float,
+) -> Retry:
+    return Retry(
+        total=total,
+        connect=connect,
+        read=read,
+        status=status,
+        backoff_factor=backoff_factor,
+        status_forcelist={429, 500, 502, 503, 504},
+        allowed_methods={"GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS"},
+        raise_on_status=False,
+    )
+
+
+def _configure_session(session: requests.Session, retry: Retry) -> requests.Session:
+    adapter = HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
 def _get_auth_session() -> requests.Session:
     session = getattr(_AUTH_SESSION_LOCAL, "session", None)
     if session is None:
-        session = requests.Session()
-        retry = Retry(
+        retry = _build_retry(
             total=int(os.environ.get("AUTH_API_RETRIES", "3")),
             connect=int(os.environ.get("AUTH_API_RETRIES_CONNECT", "3")),
             read=int(os.environ.get("AUTH_API_RETRIES_READ", "3")),
             status=int(os.environ.get("AUTH_API_RETRIES_STATUS", "3")),
             backoff_factor=float(os.environ.get("AUTH_API_RETRY_BACKOFF", "0.5")),
-            status_forcelist={429, 500, 502, 503, 504},
-            allowed_methods={"GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS"},
-            raise_on_status=False,
         )
-        adapter = HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=retry)
-        session.mount("https://", adapter)
-        session.mount("http://", adapter)
+        session = _configure_session(requests.Session(), retry)
         _AUTH_SESSION_LOCAL.session = session
+    return session
+
+
+def _get_generic_http_session() -> requests.Session:
+    session = getattr(_GENERIC_HTTP_SESSION_LOCAL, "session", None)
+    if session is None:
+        retry = _build_retry(
+            total=int(os.environ.get("HTTP_RETRIES_TOTAL", "2")),
+            connect=int(os.environ.get("HTTP_RETRIES_CONNECT", "2")),
+            read=int(os.environ.get("HTTP_RETRIES_READ", "2")),
+            status=int(os.environ.get("HTTP_RETRIES_STATUS", "2")),
+            backoff_factor=float(os.environ.get("HTTP_RETRY_BACKOFF", "0.3")),
+        )
+        session = _configure_session(requests.Session(), retry)
+        _GENERIC_HTTP_SESSION_LOCAL.session = session
     return session
 
 app = FastAPI(title="Doc/Excel → PDF & JPEG API (stable)")
@@ -88,12 +127,30 @@ def _auth_soft_fail_enabled() -> bool:
     return (os.environ.get("AUTH_ALLOW_ON_UNAVAILABLE", "true").lower() in {"1", "true", "yes", "on"})
 
 
+def _generic_http_timeout() -> float:
+    try:
+        return float(os.environ.get("HTTP_REQUEST_TIMEOUT", "20"))
+    except ValueError:
+        return 20.0
+
+
 def validate_auth_id(auth_id: str) -> bool:
     base_url = (os.environ.get("AUTH_API_BASE_URL") or DEFAULT_AUTH_API_BASE_URL or "").rstrip("/")
     if not base_url:
         raise RuntimeError("AUTH_API_BASE_URL is not configured")
     if not auth_id:
         return False
+
+    try:
+        cache_ttl = max(float(os.environ.get("AUTH_API_CACHE_TTL", "30")), 0.0)
+    except ValueError:
+        cache_ttl = 30.0
+    if cache_ttl:
+        now = time.monotonic()
+        with _AUTH_CACHE_LOCK:
+            cached = _AUTH_CACHE.get(auth_id)
+            if cached and cached[0] >= now:
+                return cached[1]
 
     url = f"{base_url}/auth-ids/verify"
     payload = {"auth_id": auth_id}
@@ -117,7 +174,23 @@ def validate_auth_id(auth_id: str) -> bool:
     except ValueError as exc:
         raise RuntimeError("auth_id validation returned invalid JSON") from exc
 
-    return bool(data.get("is_valid"))
+    result = bool(data.get("is_valid"))
+    if cache_ttl:
+        expires_at = time.monotonic() + cache_ttl
+        with _AUTH_CACHE_LOCK:
+            _AUTH_CACHE[auth_id] = (expires_at, result)
+            if len(_AUTH_CACHE) > 1024:
+                cutoff = time.monotonic()
+                stale = [k for k, (expiry, _) in _AUTH_CACHE.items() if expiry < cutoff]
+                for key in stale:
+                    _AUTH_CACHE.pop(key, None)
+                if len(_AUTH_CACHE) > 1024:
+                    try:
+                        oldest_key = next(iter(_AUTH_CACHE))
+                        _AUTH_CACHE.pop(oldest_key, None)
+                    except StopIteration:
+                        pass
+    return result
 
 # ------------ tag & number parsing ------------
 VAR_NAME = r"[A-Za-z_][A-Za-z0-9_]*"
@@ -199,15 +272,16 @@ def parse_mapping_text(raw: str) -> Tuple[Dict[str, str], Dict[str, Dict], Dict[
     if not raw: return text_map, image_map, loop_map
 
     SAFE = "\u241B"  # protect ://
-    protected = [line.replace("://", SAFE) for line in raw.splitlines()]
-    joined = "\n".join(protected)
-
     items: List[str] = []
-    for line in joined.splitlines():
-        if not line.strip(): continue
-        for seg in line.split(","):
+    for raw_line in raw.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        protected = line.replace("://", SAFE)
+        for seg in protected.split(","):
             seg = seg.strip()
-            if seg: items.append(seg.replace(SAFE, "://"))
+            if seg:
+                items.append(seg.replace(SAFE, "://"))
 
     loop_values: Dict[str, Dict[str, List[str]]] = {}
 
@@ -532,37 +606,13 @@ def _word_convert_placeholders(
 ):
     loop_vars: Dict[str, str] = {}
     loop_counter = [0]
+    loop_stack: List[str] = []
 
     def _loop_var(group: str) -> str:
         if group not in loop_vars:
             loop_counter[0] += 1
             loop_vars[group] = f"__loop_{loop_counter[0]}_{group}"
         return loop_vars[group]
-
-    def _placeholder_to_jinja(expr: str) -> str:
-        expr_clean = (expr or "").strip()
-        if not expr_clean:
-            return ""
-        parts = [p.strip() for p in expr_clean.split(":") if p.strip()]
-        if not parts:
-            return ""
-        if len(parts) >= 2 and parts[1] == "loop":
-            group = parts[0]
-            var_name = _loop_var(group)
-            if len(parts) == 2:
-                return f"{{% for {var_name} in loops.get('{group}', []) %}}"
-            field = parts[2] if len(parts) > 2 else ""
-            if not field:
-                return ""
-            return f"{{{{ {var_name}.get('{field}', '') }}}}"
-        group = parts[0]
-        if group in loop_vars or group in loop_map:
-            var_name = _loop_var(group)
-            field = parts[1] if len(parts) > 1 else ""
-            if not field:
-                return f"{{{{ {var_name} }}}}"
-            return f"{{{{ {var_name}.get('{field}', '') }}}}"
-        return f"{{{{ {expr_clean} }}}}"
 
     while True:
         nodes, full_text = _word_snapshot(root)
@@ -578,7 +628,57 @@ def _word_convert_placeholders(
             size = parse_size_mm(match.group("size") or "")
             if size is not None:
                 size_hints.setdefault(var, size)
-        replacement = _placeholder_to_jinja(match.group("txt")) if match.group("txt") else f"{{{{ {var} }}}}"
+            replacement = f"{{{{ {var} }}}}"
+            _word_splice_text(nodes, match.start(), match.end(), replacement)
+            continue
+
+        expr = match.group("txt") or ""
+        expr_clean = expr.strip()
+        parts = [p.strip() for p in expr_clean.split(":") if p.strip()]
+        replacement = ""
+
+        if parts:
+            group = parts[0]
+            if len(parts) >= 2 and parts[1] == "loop":
+                var_name = _loop_var(group)
+                if len(parts) == 2:
+                    if group not in loop_stack:
+                        loop_stack.append(group)
+                    replacement = f"{{% for {var_name} in loops.get('{group}', []) %}}"
+                else:
+                    field = parts[2] if len(parts) > 2 else ""
+                    if field:
+                        replacement = f"{{{{ {var_name}.get('{field}', '') }}}}"
+                    if group in loop_stack:
+                        remaining = full_text[match.end():]
+                        has_manual_close = "#end" in remaining
+                        has_more_group_refs = False
+                        for future in WORD_INLINE_PATTERN.finditer(remaining):
+                            future_expr = future.group("txt")
+                            if not future_expr:
+                                continue
+                            future_parts = [p.strip() for p in future_expr.split(":") if p.strip()]
+                            if future_parts and future_parts[0] == group:
+                                has_more_group_refs = True
+                                break
+                        if not has_manual_close and not has_more_group_refs:
+                            replacement += "{% endfor %}"
+                            for i in range(len(loop_stack) - 1, -1, -1):
+                                if loop_stack[i] == group:
+                                    del loop_stack[i]
+                                    break
+            else:
+                group = parts[0]
+                if group in loop_vars or group in loop_map:
+                    var_name = _loop_var(group)
+                    field = parts[1] if len(parts) > 1 else ""
+                    if not field:
+                        replacement = f"{{{{ {var_name} }}}}"
+                    else:
+                        replacement = f"{{{{ {var_name}.get('{field}', '') }}}}"
+                else:
+                    replacement = f"{{{{ {expr_clean} }}}}"
+
         _word_splice_text(nodes, match.start(), match.end(), replacement)
 
     while True:
@@ -589,6 +689,15 @@ def _word_convert_placeholders(
         if idx == -1:
             break
         _word_splice_text(nodes, idx, idx + 4, "{% endfor %}")
+        if loop_stack:
+            loop_stack.pop()
+
+    if loop_stack:
+        nodes, full_text = _word_snapshot(root)
+        if nodes:
+            closing = "{% endfor %}" * len(loop_stack)
+            _word_splice_text(nodes, len(full_text), len(full_text), closing)
+        loop_stack.clear()
 
 WORD_JINJA_PATTERN = re.compile(r"\{\{\s*(?P<var>%s)\s*\}\}" % VAR_NAME)
 
@@ -1417,12 +1526,12 @@ def _xlsx_expand_loops(
 
 
 def _decode_base64_payload(payload: str) -> Optional[bytes]:
-    data = (payload or "").strip()
+    data = re.sub(r"\s+", "", payload or "")
     if not data:
         return None
-    padding = len(data) % 4
+    padding = (-len(data)) % 4
     if padding:
-        data += "=" * (4 - padding)
+        data += "=" * padding
     try:
         return base64.b64decode(data, validate=False)
     except (binascii.Error, ValueError):
@@ -1452,11 +1561,12 @@ def _xlsx_fetch_image_bytes(source: str) -> Optional[bytes]:
     if text.startswith("base64,"):
         return _decode_base64_payload(text[7:])
 
+    session = _get_generic_http_session()
     try:
-        resp = requests.get(text, timeout=20)
+        resp = session.get(text, timeout=_generic_http_timeout())
         resp.raise_for_status()
         return resp.content
-    except Exception:
+    except requests.RequestException:
         return None
 
 
@@ -2432,9 +2542,10 @@ def _download_template_from_url(url: str) -> Tuple[Optional[bytes], Optional[str
     if not source:
         return None, None
     try:
-        resp = requests.get(source, timeout=30)
+        session = _get_generic_http_session()
+        resp = session.get(source, timeout=_generic_http_timeout())
         resp.raise_for_status()
-    except Exception:
+    except requests.RequestException:
         return None, None
     data = resp.content
     mime = resp.headers.get("Content-Type", "")
