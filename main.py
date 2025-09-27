@@ -603,100 +603,112 @@ def _word_convert_placeholders(
     size_hints: Dict[str, Optional[float]],
     loop_map: Dict[str, List[Dict[str, str]]],
 ):
+    nodes, full_text = _word_snapshot(root)
+    if not nodes:
+        return
+
     loop_vars: Dict[str, str] = {}
-    loop_counter = [0]
+    loop_counter = 0
+    loop_occurrences: Dict[str, int] = {}
+    loop_field_hits: Dict[str, int] = {}
     loop_stack: List[str] = []
 
     def _loop_var(group: str) -> str:
+        nonlocal loop_counter
         if group not in loop_vars:
-            loop_counter[0] += 1
-            loop_vars[group] = f"__loop_{loop_counter[0]}_{group}"
+            loop_counter += 1
+            loop_vars[group] = f"__loop_{loop_counter}_{group}"
         return loop_vars[group]
 
-    while True:
-        nodes, full_text = _word_snapshot(root)
-        if not nodes:
-            break
-        match = WORD_INLINE_PATTERN.search(full_text)
-        if not match:
-            break
-        var = match.group("img") or match.group("txt")
-        if not var:
-            break
-        if match.group("img"):
-            size = parse_size_mm(match.group("size") or "")
-            if size is not None:
-                size_hints.setdefault(var, size)
-            replacement = f"{{{{ {var} }}}}"
-            _word_splice_text(nodes, match.start(), match.end(), replacement)
+    for match in WORD_INLINE_PATTERN.finditer(full_text):
+        expr = match.group("txt") or ""
+        expr = expr.strip()
+        if not expr:
+            continue
+        parts = [p.strip() for p in expr.split(":") if p.strip()]
+        if len(parts) >= 2 and parts[1] == "loop":
+            group = parts[0]
+            loop_occurrences[group] = loop_occurrences.get(group, 0) + 1
+
+    pieces: List[str] = []
+    pos = 0
+
+    while pos < len(full_text):
+        next_placeholder = WORD_INLINE_PATTERN.search(full_text, pos)
+        next_end = full_text.find("#end", pos)
+
+        if next_end != -1 and (next_placeholder is None or next_end < next_placeholder.start()):
+            pieces.append(full_text[pos:next_end])
+            if loop_stack:
+                pieces.append("{%- endfor %}")
+                loop_stack.pop()
+            pos = next_end + 4
             continue
 
-        expr = match.group("txt") or ""
+        if next_placeholder is None:
+            pieces.append(full_text[pos:])
+            break
+
+        pieces.append(full_text[pos:next_placeholder.start()])
+
+        img_var = next_placeholder.group("img")
+        if img_var:
+            size = parse_size_mm(next_placeholder.group("size") or "")
+            if size is not None:
+                size_hints.setdefault(img_var, size)
+            pieces.append(f"{{{{ {img_var} }}}}")
+            pos = next_placeholder.end()
+            continue
+
+        expr = next_placeholder.group("txt") or ""
         expr_clean = expr.strip()
         parts = [p.strip() for p in expr_clean.split(":") if p.strip()]
-        replacement = ""
+        replacement = next_placeholder.group(0)
 
         if parts:
             group = parts[0]
             if len(parts) >= 2 and parts[1] == "loop":
                 var_name = _loop_var(group)
                 if len(parts) == 2:
-                    if group not in loop_stack:
-                        loop_stack.append(group)
+                    loop_stack.append(group)
                     replacement = f"{{%- for {var_name} in loops.get('{group}', []) %}}"
                 else:
                     field = parts[2] if len(parts) > 2 else ""
                     if field:
                         replacement = f"{{{{ {var_name}.get('{field}', '') }}}}"
-                    if group in loop_stack:
-                        remaining = full_text[match.end():]
-                        has_manual_close = "#end" in remaining
-                        has_more_group_refs = False
-                        for future in WORD_INLINE_PATTERN.finditer(remaining):
-                            future_expr = future.group("txt")
-                            if not future_expr:
-                                continue
-                            future_parts = [p.strip() for p in future_expr.split(":") if p.strip()]
-                            if future_parts and future_parts[0] == group:
-                                has_more_group_refs = True
-                                break
-                        if not has_manual_close and not has_more_group_refs:
-                            replacement += "{%- endfor %}"
-                            for i in range(len(loop_stack) - 1, -1, -1):
-                                if loop_stack[i] == group:
-                                    del loop_stack[i]
-                                    break
+                    else:
+                        replacement = f"{{{{ {var_name} }}}}"
+                    loop_field_hits[group] = loop_field_hits.get(group, 0) + 1
+                if group in loop_occurrences:
+                    loop_occurrences[group] -= 1
+                if (
+                    loop_occurrences.get(group, 0) <= 0
+                    and loop_field_hits.get(group, 0) > 0
+                    and loop_stack
+                    and loop_stack[-1] == group
+                ):
+                    replacement += "{%- endfor %}"
+                    loop_stack.pop()
             else:
-                group = parts[0]
                 if group in loop_vars or group in loop_map:
                     var_name = _loop_var(group)
                     field = parts[1] if len(parts) > 1 else ""
-                    if not field:
-                        replacement = f"{{{{ {var_name} }}}}"
-                    else:
+                    if field:
                         replacement = f"{{{{ {var_name}.get('{field}', '') }}}}"
+                    else:
+                        replacement = f"{{{{ {var_name} }}}}"
                 else:
                     replacement = f"{{{{ {expr_clean} }}}}"
 
-        _word_splice_text(nodes, match.start(), match.end(), replacement)
+        pieces.append(replacement)
+        pos = next_placeholder.end()
 
-    while True:
-        nodes, full_text = _word_snapshot(root)
-        if not nodes:
-            break
-        idx = full_text.find("#end")
-        if idx == -1:
-            break
-        _word_splice_text(nodes, idx, idx + 4, "{%- endfor %}")
-        if loop_stack:
-            loop_stack.pop()
+    while loop_stack:
+        pieces.append("{%- endfor %}")
+        loop_stack.pop()
 
-    if loop_stack:
-        nodes, full_text = _word_snapshot(root)
-        if nodes:
-            closing = "{%- endfor %}" * len(loop_stack)
-            _word_splice_text(nodes, len(full_text), len(full_text), closing)
-        loop_stack.clear()
+    converted = "".join(pieces)
+    _word_splice_text(nodes, 0, len(full_text), converted)
 
 WORD_JINJA_PATTERN = re.compile(r"\{\{\s*(?P<var>%s)\s*\}\}" % VAR_NAME)
 
@@ -1287,7 +1299,15 @@ def _xlsx_expand_loops(
                     _xlsx_clear_cell_value(cell)
                 continue
             if len(groups) > 1:
-                raise ValueError("Multiple loop groups in a single cell are not supported")
+                merged = original_text
+                for group in groups:
+                    merged = _xlsx_apply_loop_text(merged, group, {}, text_map) or ""
+                if merged:
+                    _xlsx_set_inline_text(cell, ns, merged)
+                else:
+                    _xlsx_clear_cell_value(cell)
+                continue
+
             group = next(iter(groups))
             entries = loop_map.get(group) or []
             template = original_text
