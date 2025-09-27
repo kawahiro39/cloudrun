@@ -19,9 +19,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from dataclasses import dataclass
-
-from fastapi import FastAPI, UploadFile, File, Form, Header
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 
 _GENERIC_HTTP_SESSION_LOCAL = threading.local()
@@ -96,145 +94,11 @@ def err(message, status=400):
         return JSONResponse(status_code=status, content=payload)
     return JSONResponse(status_code=status, content={"error": str(message)})
 
-
-def _auth_api_timeout() -> float:
-    try:
-        return float(os.environ.get("AUTH_API_TIMEOUT", "5"))
-    except ValueError:
-        return 5.0
-
-
-def _auth_soft_fail_enabled() -> bool:
-    return os.environ.get("AUTH_ALLOW_ON_UNAVAILABLE", "true").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
 def _generic_http_timeout() -> float:
     try:
         return float(os.environ.get("HTTP_REQUEST_TIMEOUT", "20"))
     except ValueError:
         return 20.0
-
-
-def validate_auth_id(auth_id: str) -> bool:
-    base_url = (os.environ.get("AUTH_API_BASE_URL") or DEFAULT_AUTH_API_BASE_URL or "").rstrip("/")
-    if not base_url:
-        raise RuntimeError("AUTH_API_BASE_URL is not configured")
-    if not auth_id:
-        return False
-
-    try:
-        cache_ttl = max(float(os.environ.get("AUTH_API_CACHE_TTL", "30")), 0.0)
-    except ValueError:
-        cache_ttl = 30.0
-    if cache_ttl:
-        now = time.monotonic()
-        with _AUTH_CACHE_LOCK:
-            cached = _AUTH_CACHE.get(auth_id)
-            if cached and cached[0] >= now:
-                return cached[1]
-
-    url = f"{base_url}/auth-ids/verify"
-    payload = {"auth_id": auth_id}
-    session = _get_auth_session()
-    try:
-        resp = session.post(url, json=payload, timeout=_auth_api_timeout())
-    except requests.RequestException as exc:
-        raise AuthServiceUnavailable(f"auth_id validation request failed: {exc}")
-
-    if resp.status_code in {401, 404}:
-        return False
-    if resp.status_code >= 400:
-        if resp.status_code >= 500:
-            raise AuthServiceUnavailable(
-                f"auth_id validation service unavailable (status {resp.status_code})"
-            )
-        raise RuntimeError(f"auth_id validation failed with status {resp.status_code}")
-
-    try:
-        data = resp.json()
-    except ValueError as exc:
-        raise RuntimeError("auth_id validation returned invalid JSON") from exc
-
-    result = bool(data.get("is_valid"))
-    if cache_ttl:
-        expires_at = time.monotonic() + cache_ttl
-        with _AUTH_CACHE_LOCK:
-            _AUTH_CACHE[auth_id] = (expires_at, result)
-            if len(_AUTH_CACHE) > 1024:
-                cutoff = time.monotonic()
-                stale = [k for k, (expiry, _) in _AUTH_CACHE.items() if expiry < cutoff]
-                for key in stale:
-                    _AUTH_CACHE.pop(key, None)
-                if len(_AUTH_CACHE) > 1024:
-                    try:
-                        oldest_key = next(iter(_AUTH_CACHE))
-                        _AUTH_CACHE.pop(oldest_key, None)
-                    except StopIteration:
-                        pass
-    return result
-
-
-def _auth_enforcement_mode() -> str:
-    mode = os.environ.get("AUTH_MODE", "disabled").strip().lower()
-    if mode not in {"disabled", "optional", "required"}:
-        return "disabled"
-    return mode
-
-
-def _extract_auth_id(x_auth_id: Optional[str], authorization: Optional[str]) -> str:
-    auth_id = (x_auth_id or "").strip()
-    if auth_id:
-        return auth_id
-    token = (authorization or "").strip()
-    if not token:
-        return ""
-    if token.lower().startswith("bearer "):
-        token = token[7:].strip()
-    return token
-
-
-@dataclass
-class AuthDecision:
-    allowed: bool
-    status: int = 200
-    message: str = ""
-    warning: Optional[str] = None
-    auth_id: str = ""
-
-
-def _authorize_request(x_auth_id: Optional[str], authorization: Optional[str]) -> AuthDecision:
-    mode = _auth_enforcement_mode()
-    if mode == "disabled":
-        return AuthDecision(True, auth_id="")
-
-    auth_id = _extract_auth_id(x_auth_id, authorization)
-    if not auth_id:
-        if mode == "required":
-            return AuthDecision(False, status=401, message="missing auth_id")
-        return AuthDecision(True, warning="auth_id not supplied", auth_id="")
-
-    try:
-        is_valid = validate_auth_id(auth_id)
-    except AuthServiceUnavailable as exc:
-        if _auth_soft_fail_enabled():
-            return AuthDecision(True, warning=str(exc), auth_id=auth_id)
-        return AuthDecision(False, status=503, message=str(exc))
-    except Exception as exc:  # pragma: no cover - defensive catch
-        if mode == "required":
-            return AuthDecision(False, status=500, message=str(exc))
-        return AuthDecision(True, warning=str(exc), auth_id=auth_id)
-
-    if not is_valid:
-        if mode == "required":
-            return AuthDecision(False, status=401, message="invalid auth_id")
-        return AuthDecision(True, warning="auth_id validation failed", auth_id=auth_id)
-
-    return AuthDecision(True, auth_id=auth_id)
 
 
 # ------------ tag & number parsing ------------
@@ -2420,11 +2284,6 @@ async def merge(
     from pypdf import PdfReader  # lazy import
 
     try:
-        auth_decision = _authorize_request(x_auth_id, authorization)
-        if not auth_decision.allowed:
-            message = auth_decision.message or "authorization failed"
-            return err(message, status=auth_decision.status)
-
         template_bytes: Optional[bytes] = None
         ext = ""
         if file is not None:
@@ -2518,9 +2377,6 @@ async def merge(
 
             if not response:
                 response["message"] = "No outputs requested"
-
-            if auth_decision.warning:
-                response.setdefault("diagnostics", {})["auth_warning"] = auth_decision.warning
 
             return ok(response)
     except Exception as e:

@@ -37,9 +37,6 @@ The server exposes a health check at `GET /healthz` and the main processing endp
 | `return_pdf` | form-data | bool | When `true`, include the merged PDF data URI |
 | `return_jpegs` | form-data | bool | When `true`, include JPEG previews |
 | `return_document` | form-data | bool | When `true`, include the patched `.docx`/`.xlsx` data URI |
-| `X-Auth-Id` | header | string | Optional auth token (see below) |
-| `Authorization` | header | string | Alternative header for the auth token (`Bearer <token>`) |
-
 Provide the Office template either as a multipart file upload (`file`), a data URI/Base64 string (`file_data_uri`), or a downloadable URL (`file_url`). Only one source is required. Responses are JSON. Depending on the selected flags the payload can contain `pdf_data_uri`, `jpeg_data_uris`, and/or `document_data_uri` entries. All binary payloads are returned as data URIs with appropriate MIME types.
 
 ### Authentication
