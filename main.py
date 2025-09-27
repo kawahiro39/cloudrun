@@ -1068,6 +1068,22 @@ def _xlsx_set_inline_text(cell: ET.Element, ns: Dict[str, str], text: str):
     t_node.text = text or ""
 
 
+def _xlsx_clear_cell_value(cell: ET.Element):
+    for child in list(cell):
+        if child.tag == f"{{{S_NS}}}f":
+            continue
+        cell.remove(child)
+    if "t" in cell.attrib:
+        del cell.attrib["t"]
+
+
+def _xlsx_cell_has_group_token(text: str, group: str) -> bool:
+    if not text:
+        return False
+    marker = f"{{{group}:"
+    return marker in text
+
+
 def _xlsx_apply_loop_text(
     text: str,
     group: str,
@@ -1170,15 +1186,23 @@ def _xlsx_expand_loops(
         entries = loop_map.get(group, [])
         insert_pos = idx
         if entries:
-            for entry in entries:
+            for entry_idx, entry in enumerate(entries):
                 for tmpl in template_bases:
                     clone = copy.deepcopy(tmpl)
                     for cell in clone.findall("s:c", ns):
                         original_text = _xlsx_cell_text(cell, ns, shared_strings)
                         if original_text is None:
                             continue
+                        has_group_token = _xlsx_cell_has_group_token(original_text, group)
                         replaced = _xlsx_apply_loop_text(original_text, group, entry, text_map)
-                        if replaced != original_text or f"{{{group}:" in original_text or "#end" in original_text:
+                        if entry_idx > 0 and not has_group_token:
+                            _xlsx_clear_cell_value(cell)
+                            continue
+                        if (
+                            replaced != original_text
+                            or has_group_token
+                            or "#end" in original_text
+                        ):
                             _xlsx_set_inline_text(cell, ns, replaced)
                     sheet_data.insert(insert_pos, clone)
                     insert_pos += 1
