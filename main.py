@@ -2147,9 +2147,83 @@ def healthz():
     # Cloud Run 起動判定用：即応答
     return {"ok": True}
 
+def _guess_office_ext_from_mime(mime: str) -> Optional[str]:
+    if not mime:
+        return None
+    mime = mime.split(";", 1)[0].strip().lower()
+    mapping = {
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+        "application/vnd.ms-word.document.macroenabled.12": ".docm",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+        "application/vnd.ms-excel.sheet.macroenabled.12": ".xlsm",
+    }
+    ext = mapping.get(mime)
+    if ext in {".docm", ".xlsm"}:
+        return ".docx" if ext == ".docm" else ".xlsx"
+    return ext
+
+
+def _sniff_office_extension(data: Optional[bytes]) -> Optional[str]:
+    if not data:
+        return None
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            names = zf.namelist()
+    except zipfile.BadZipFile:
+        return None
+    for prefix, ext in (("word/", ".docx"), ("xl/", ".xlsx")):
+        if any(name.startswith(prefix) for name in names):
+            return ext
+    return None
+
+
+def _load_template_from_data_string(text: str) -> Tuple[Optional[bytes], Optional[str]]:
+    value = (text or "").strip()
+    if not value:
+        return None, None
+    if value.startswith("data:"):
+        header, _, payload = value.partition(",")
+        if not payload:
+            return None, None
+        mime = ""
+        if header.startswith("data:"):
+            mime = header[5:]
+            if ";" in mime:
+                mime = mime.split(";", 1)[0]
+        if ";base64" in header:
+            data = _decode_base64_payload(payload)
+        else:
+            data = urllib.parse.unquote_to_bytes(payload)
+        return data, _guess_office_ext_from_mime(mime)
+    if value.startswith("base64:"):
+        _, _, payload = value.partition(":")
+        return _decode_base64_payload(payload), None
+    if value.startswith("base64,"):
+        return _decode_base64_payload(value[7:]), None
+    return None, None
+
+
+def _download_template_from_url(url: str) -> Tuple[Optional[bytes], Optional[str]]:
+    source = (url or "").strip()
+    if not source:
+        return None, None
+    try:
+        resp = requests.get(source, timeout=30)
+        resp.raise_for_status()
+    except Exception:
+        return None, None
+    data = resp.content
+    mime = resp.headers.get("Content-Type", "")
+    ext = _guess_office_ext_from_mime(mime)
+    if not ext:
+        path = urllib.parse.urlparse(source).path
+        ext = file_ext_lower(path)
+    return data, ext
+
+
 @app.post("/merge")
 async def merge(
-    file: UploadFile = File(...),
+    file: Optional[UploadFile] = File(None),
     mapping_text: str = Form(""),
     filename: str = Form("document"),
     jpeg_dpi: int = Form(150),
@@ -2157,6 +2231,8 @@ async def merge(
     return_pdf: bool = Form(True),
     return_jpegs: bool = Form(True),
     return_document: bool = Form(True),
+    file_data_uri: str = Form(""),
+    file_url: str = Form(""),
     x_auth_id: Optional[str] = Header(None, alias="X-Auth-Id"),
     authorization: Optional[str] = Header(None),
 ):
@@ -2175,15 +2251,40 @@ async def merge(
         if not validate_auth_id(auth_id):
             return err("invalid auth_id", status=401)
 
-        ext = file_ext_lower(file.filename or "")
-        if ext not in [".docx", ".xlsx"]:
+        template_bytes: Optional[bytes] = None
+        ext = ""
+        if file is not None:
+            template_bytes = await file.read()
+            ext = file_ext_lower(file.filename or "")
+
+        if (template_bytes is None or not template_bytes) and file_data_uri:
+            template_bytes, inferred_ext = _load_template_from_data_string(file_data_uri)
+            if inferred_ext and not ext:
+                ext = inferred_ext
+
+        if (template_bytes is None or not template_bytes) and file_url:
+            template_bytes, inferred_ext = _download_template_from_url(file_url)
+            if inferred_ext and not ext:
+                ext = inferred_ext
+
+        if not template_bytes:
+            return err("file must be provided via upload, data URI, or URL", 400)
+
+        sniffed_ext = _sniff_office_extension(template_bytes)
+        if sniffed_ext and ext not in {".docx", ".xlsx"}:
+            ext = sniffed_ext
+        if not ext:
+            ext = sniffed_ext or ""
+
+        if ext not in {".docx", ".xlsx"}:
             return err("file must be .docx or .xlsx", 400)
 
         text_map, image_map, loop_map = parse_mapping_text(mapping_text or "")
 
         with tempfile.TemporaryDirectory() as td:
             src = os.path.join(td, f"src{ext}")
-            with open(src, "wb") as f: f.write(await file.read())
+            with open(src, "wb") as f:
+                f.write(template_bytes)
 
             rendered = os.path.join(td, f"rendered{ext}")
             if ext == ".docx":

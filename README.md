@@ -28,7 +28,9 @@ The server exposes a health check at `GET /healthz` and the main processing endp
 
 | Field | Location | Type | Description |
 |-------|----------|------|-------------|
-| `file` | form-data | file | Required `.docx` or `.xlsx` template |
+| `file` | form-data | file | `.docx` or `.xlsx` template upload |
+| `file_data_uri` | form-data | string | Alternative to `file`: template as data URI or Base64 |
+| `file_url` | form-data | string | Alternative to `file`: URL pointing to the template |
 | `mapping_text` | form-data | string | Placeholder/value mapping (see below) |
 | `filename` | form-data | string | Base name for generated files (defaults to `document`) |
 | `jpeg_dpi` | form-data | int | JPEG output DPI (default `150`) |
@@ -38,7 +40,7 @@ The server exposes a health check at `GET /healthz` and the main processing endp
 | `return_document` | form-data | bool | When `true`, include the patched `.docx`/`.xlsx` data URI |
 | `X-Auth-Id` | header | string | Required authentication token |
 
-Responses are JSON. Depending on the selected flags the payload can contain `pdf_data_uri`, `jpeg_data_uris`, and/or `document_data_uri` entries. All binary payloads are returned as data URIs with appropriate MIME types.
+Provide the Office template either as a multipart file upload (`file`), a data URI/Base64 string (`file_data_uri`), or a downloadable URL (`file_url`). Only one source is required. Responses are JSON. Depending on the selected flags the payload can contain `pdf_data_uri`, `jpeg_data_uris`, and/or `document_data_uri` entries. All binary payloads are returned as data URIs with appropriate MIME types.
 
 ### Placeholder syntax
 
