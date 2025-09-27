@@ -8,8 +8,6 @@ This project exposes a FastAPI application that patches Word (`.docx`) or Excel 
 * System tools used by the conversion pipeline:
   * `soffice` (LibreOffice) for Office → PDF conversion
   * `pdftoppm` for PDF → JPEG conversion
-* The services that call this API must pass a valid `auth_id`. The server validates this token against `AUTH_API_BASE_URL` (defaults to the production endpoint in `main.py`).
-  * If the upstream auth service is unavailable you can allow requests to proceed by leaving `AUTH_ALLOW_ON_UNAVAILABLE` at its default of `true`. Set it to `false` to preserve the strict 503 failure mode.
 
 Install Python dependencies:
 
@@ -39,7 +37,6 @@ The server exposes a health check at `GET /healthz` and the main processing endp
 | `return_pdf` | form-data | bool | When `true`, include the merged PDF data URI |
 | `return_jpegs` | form-data | bool | When `true`, include JPEG previews |
 | `return_document` | form-data | bool | When `true`, include the patched `.docx`/`.xlsx` data URI |
-| `X-Auth-Id` | header | string | Required authentication token |
 
 Provide the Office template either as a multipart file upload (`file`), a data URI/Base64 string (`file_data_uri`), or a downloadable URL (`file_url`). Only one source is required. Responses are JSON. Depending on the selected flags the payload can contain `pdf_data_uri`, `jpeg_data_uris`, and/or `document_data_uri` entries. All binary payloads are returned as data URIs with appropriate MIME types.
 
@@ -80,7 +77,6 @@ If the download fails or the data cannot be decoded the placeholder is left unto
 
 ```bash
 curl -X POST http://localhost:8080/merge \
-  -H 'X-Auth-Id: YOUR_AUTH_ID' \
   -F 'file=@template.xlsx' \
   -F 'mapping_text={name}:Alice,{[logo]}:data:image/png;base64,iVBORw0...' \
   -F 'filename=report' \
@@ -99,4 +95,4 @@ python -m compileall main.py
 
 ## Deployment
 
-The application is packaged for Google Cloud Run via the provided `Dockerfile`. Ensure the runtime image has LibreOffice and Poppler (`pdftoppm`) installed and set the `AUTH_API_BASE_URL` environment variable if you need to target a non-default authentication service.
+The application is packaged for Google Cloud Run via the provided `Dockerfile`. Ensure the runtime image has LibreOffice and Poppler (`pdftoppm`) installed.
