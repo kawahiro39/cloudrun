@@ -101,6 +101,7 @@ VAR_NAME = r"[A-Za-z_][A-Za-z0-9_]*"
 VAR_PATH = r"[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*"
 IMG_KEY_PATTERN = re.compile(rf"^\{{\[(?P<var>{VAR_NAME})\](?::(?P<size>[^}}]+))?\}}$")
 TXT_KEY_PATTERN = re.compile(rf"^\{{(?P<var>{VAR_NAME})\}}$")
+TEXT_TOKEN_PATTERN = re.compile(rf"\{{\s*(?P<var>{VAR_NAME})\s*\}}")
 LOOP_KEY_PATTERN = re.compile(rf"^\{{(?P<group>{VAR_NAME}):loop:(?P<field>{VAR_NAME})\}}$")
 IMG_TAG_PATTERN = re.compile(rf"\{{\[(?P<var>{VAR_NAME})\](?::(?P<size>[^}}]+))?\}}")
 WORD_INLINE_PATTERN = re.compile(
@@ -234,10 +235,14 @@ def parse_mapping_text(raw: str) -> Tuple[Dict[str, str], Dict[str, Dict], Dict[
 def _apply_text_tokens(text: Optional[str], text_map: Dict[str, str]) -> Optional[str]:
     if text is None or not text_map:
         return text
-    result = text
-    for key, value in text_map.items():
-        result = result.replace(f"{{{key}}}", value)
-    return result
+
+    def _replace(match: re.Match[str]) -> str:
+        var = match.group("var")
+        if var in text_map:
+            return text_map[var]
+        return match.group(0)
+
+    return TEXT_TOKEN_PATTERN.sub(_replace, text)
 
 def mm_to_pixels(mm: float, dpi: int = 96) -> int:
     return int(round(mm / 25.4 * dpi))
