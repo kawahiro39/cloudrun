@@ -18,6 +18,7 @@ import urllib.parse
 
 import requests
 from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from fastapi import FastAPI, UploadFile, File, Form, Header
 from fastapi.responses import JSONResponse
@@ -27,11 +28,25 @@ DEFAULT_AUTH_API_BASE_URL = "https://auth-677366504119.asia-northeast1.run.app"
 _AUTH_SESSION_LOCAL = threading.local()
 
 
+class AuthServiceUnavailable(RuntimeError):
+    """Raised when the external auth validation service is unavailable."""
+
+
 def _get_auth_session() -> requests.Session:
     session = getattr(_AUTH_SESSION_LOCAL, "session", None)
     if session is None:
         session = requests.Session()
-        adapter = HTTPAdapter(pool_connections=8, pool_maxsize=8)
+        retry = Retry(
+            total=int(os.environ.get("AUTH_API_RETRIES", "3")),
+            connect=int(os.environ.get("AUTH_API_RETRIES_CONNECT", "3")),
+            read=int(os.environ.get("AUTH_API_RETRIES_READ", "3")),
+            status=int(os.environ.get("AUTH_API_RETRIES_STATUS", "3")),
+            backoff_factor=float(os.environ.get("AUTH_API_RETRY_BACKOFF", "0.5")),
+            status_forcelist={429, 500, 502, 503, 504},
+            allowed_methods={"GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS"},
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=retry)
         session.mount("https://", adapter)
         session.mount("http://", adapter)
         _AUTH_SESSION_LOCAL.session = session
@@ -82,11 +97,15 @@ def validate_auth_id(auth_id: str) -> bool:
     try:
         resp = session.post(url, json=payload, timeout=_auth_api_timeout())
     except requests.RequestException as exc:
-        raise RuntimeError(f"auth_id validation request failed: {exc}")
+        raise AuthServiceUnavailable(f"auth_id validation request failed: {exc}")
 
     if resp.status_code in {401, 404}:
         return False
     if resp.status_code >= 400:
+        if resp.status_code >= 500:
+            raise AuthServiceUnavailable(
+                f"auth_id validation service unavailable (status {resp.status_code})"
+            )
         raise RuntimeError(f"auth_id validation failed with status {resp.status_code}")
 
     try:
@@ -2449,8 +2468,11 @@ async def merge(
         if not auth_id:
             return err("missing auth_id", status=401)
 
-        if not validate_auth_id(auth_id):
-            return err("invalid auth_id", status=401)
+        try:
+            if not validate_auth_id(auth_id):
+                return err("invalid auth_id", status=401)
+        except AuthServiceUnavailable as exc:
+            return err(str(exc), status=503)
 
         template_bytes: Optional[bytes] = None
         ext = ""
